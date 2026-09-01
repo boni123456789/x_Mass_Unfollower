@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "CleanSweep X - Live Bridge",
+  "version": "1.4.3",
+  "description": "Live cookie/session bridge: unfollow + tweet preview via the open x.com tab.",
+  "permissions": [
+    "cookies",
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://*.x.com/*",
+    "https://twitter.com/*",
+    "https://*.twitter.com/*",
+    "https://api.x.com/*",
+    "https://api.twitter.com/*",
+    "https://abs.twimg.com/*",
+    "https://*.twimg.com/*",
+    "http://localhost/*",
+    "http://localhost:5173/*",
+    "http://localhost:5174/*",
+    "http://localhost:5175/*",
+    "http://localhost:3000/*",
+    "http://localhost:3001/*",
+    "http://localhost:4173/*",
+    "http://127.0.0.1/*",
+    "http://127.0.0.1:5173/*",
+    "http://127.0.0.1:5174/*",
+    "http://127.0.0.1:5175/*",
+    "http://127.0.0.1:3000/*",
+    "http://127.0.0.1:3001/*",
+    "http://127.0.0.1:4173/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost/*",
+        "http://localhost:5173/*",
+        "http://localhost:5174/*",
+        "http://localhost:5175/*",
+        "http://localhost:3000/*",
+        "http://localhost:3001/*",
+        "http://localhost:4173/*",
+        "http://127.0.0.1/*",
+        "http://127.0.0.1:5173/*",
+        "http://127.0.0.1:5174/*",
+        "http://127.0.0.1:5175/*",
+        "http://127.0.0.1:3000/*",
+        "http://127.0.0.1:3001/*",
+        "http://127.0.0.1:4173/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["gql_spy.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["tweetCore.js", "x_content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "CleanSweep X Bridge"
+  }
+}
