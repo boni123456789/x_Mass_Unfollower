@@ -51,79 +51,7 @@
     return null;
   }
 
-  // Inject floating sync widget into x.com bottom right corner
-  function injectFloatingWidget() {
-    if (document.getElementById('csx-floating-widget')) return;
-
-    const widget = document.createElement('div');
-    widget.id = 'csx-floating-widget';
-    widget.style.cssText = `
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 999999;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      background: #111318;
-      color: #ffffff;
-      border: 1px solid rgba(255, 255, 255, 0.16);
-      padding: 8px 16px;
-      border-radius: 999px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      font-size: 13px;
-      font-weight: 700;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
-      cursor: pointer;
-      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-      user-select: none;
-    `;
-
-    widget.innerHTML = `
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-        <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
-      </svg>
-      <span>⚡ Sync mit CleanSweep X</span>
-    `;
-
-    widget.addEventListener('mouseenter', () => {
-      widget.style.transform = 'translateY(-2px) scale(1.03)';
-      widget.style.borderColor = '#1D9BF0';
-    });
-
-    widget.addEventListener('mouseleave', () => {
-      widget.style.transform = 'none';
-      widget.style.borderColor = 'rgba(255, 255, 255, 0.16)';
-    });
-
-    widget.addEventListener('click', () => {
-      widget.style.opacity = '0.7';
-      widget.style.background = '#111318';
-      widget.innerHTML = `<span>⏳ Laden & Synchronisieren...</span>`;
-
-      const domProfile = getDOMUserProfile();
-
-      // Delegate sync to extension background worker (avoids browser PNA / mixed-content blocks)
-      chrome.runtime.sendMessage({ type: 'RUN_X_SYNC', domProfile }, (result) => {
-        if (result && result.success) {
-          widget.style.background = '#059669';
-          widget.style.opacity = '1';
-          widget.innerHTML = `<span>✅ ${result.count} Profile gesendet!</span>`;
-          setTimeout(() => {
-            window.open('http://localhost:5173', '_blank');
-            injectFloatingWidget();
-          }, 1200);
-        } else {
-          widget.style.background = '#DC2626';
-          widget.style.opacity = '1';
-          widget.innerHTML = `<span>❌ ${result?.error || 'Fehler beim Sync'}</span>`;
-          setTimeout(() => injectFloatingWidget(), 3500);
-        }
-      });
-    });
-
-    document.body.appendChild(widget);
-  }
+  // Floating on-screen widget removed per user request (sync triggered via extension toolbar icon)
 
   const BEARER = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
   const Core = globalThis.CSXTweetCore;
@@ -161,11 +89,12 @@
 
   function liveFeatures() {
     const meta = readLiveGqlMeta();
-    const from = (meta.UserTweets || meta.HomeTimeline || meta.HomeLatestTimeline || meta.SearchTimeline || {});
-    if (from.features && typeof from.features === 'object' && Object.keys(from.features).length > 5) {
-      return { ...from.features };
+    const from = (meta.UserTweets || {});
+    const base = { ...((Core && Core.GQL_FEATURES) || {}) };
+    if (from.features && typeof from.features === 'object') {
+      return { ...base, ...from.features };
     }
-    return { ...((Core && Core.GQL_FEATURES) || {}) };
+    return base;
   }
 
   function spyReady() {
@@ -304,7 +233,9 @@
         features
       );
       if (!data) break;
+      const before = collected.length;
       collected.push(...Core.tweetsFromGraphQL(data));
+      if (page === 0 && collected.length === before) break;
       const posts = Core.formatAndFilterTweets(collected, handle, uid);
       if (posts.length >= 3) return posts;
       cursor = Core.findBottomCursor(data);
@@ -314,87 +245,131 @@
   }
 
   async function collectOriginalPosts(headers, features, ids, handle, uid) {
+    let best = [];
+    const take = (posts) => {
+      if (Array.isArray(posts) && posts.length > best.length) best = posts;
+      return best.length >= 3;
+    };
     if (ids.UserTweets && uid) {
       const posts = await paginatePosts(
         headers, features,
         (cursor) => Core.userTweetsVariables(uid, cursor),
         ids.UserTweets, 'UserTweets', handle, uid, 5
       );
-      if (posts.length) return posts;
+      if (take(posts)) return best;
     }
     if (ids.SearchTimeline && handle) {
       const posts = await paginatePosts(
         headers, features,
         (cursor) => Core.searchVariables(handle, cursor),
-        ids.SearchTimeline, 'SearchTimeline', handle, uid, 5
+        ids.SearchTimeline, 'SearchTimeline', handle, uid, 3
       );
-      if (posts.length) return posts;
-    }
-    if (ids.UserTweetsAndReplies && uid) {
-      const posts = await paginatePosts(
-        headers, features,
-        (cursor) => Core.userTweetsVariables(uid, cursor),
-        ids.UserTweetsAndReplies, 'UserTweetsAndReplies', handle, uid, 5
-      );
-      if (posts.length) return posts;
+      if (take(posts)) return best;
     }
     const qs = uid ? `user_id=${encodeURIComponent(uid)}` : `screen_name=${encodeURIComponent(handle)}`;
     const url = `/i/api/1.1/statuses/user_timeline.json?${qs}&count=50&include_rts=false&exclude_replies=true&tweet_mode=extended`;
     const rest = await pageFetchJson(url, headers);
     if (rest.ok && Array.isArray(rest.data)) {
-      return Core.formatAndFilterTweets(rest.data, handle, uid);
+      take(Core.formatAndFilterTweets(rest.data, handle, uid));
     }
-    return [];
+    return best;
   }
 
   async function fetchPreviewTweets(handle, userId) {
     if (!Core) return [];
     const headers = apiHeaders();
     const features = liveFeatures();
-    let ids = await discoverAllQueryIds(false);
+    let ids = queryIdCache || await discoverAllQueryIds(false);
+    if (!ids.UserTweets || !ids.SearchTimeline) {
+      ids = await discoverAllQueryIds(true);
+    }
     let uid = userId && /^\d+$/.test(String(userId)) ? String(userId) : '';
     if (!uid) uid = await resolveUserId(handle, headers, ids);
 
     let posts = await collectOriginalPosts(headers, features, ids, handle, uid);
     if (posts.length) return posts;
 
-    ids = await discoverAllQueryIds(true);
-    if (!uid) uid = await resolveUserId(handle, headers, ids);
-    return collectOriginalPosts(headers, features, ids, handle, uid);
+    if (!queryIdCache || !queryIdCache.UserTweets) {
+      ids = await discoverAllQueryIds(true);
+      if (!uid) uid = await resolveUserId(handle, headers, ids);
+      posts = await collectOriginalPosts(headers, features, ids, handle, uid);
+    }
+    return posts;
   }
 
   async function unfollowInPage(handle, userId) {
     const headers = apiHeaders();
     let uid = userId && /^\d+$/.test(String(userId)) ? String(userId) : '';
-    const body = uid
-      ? `user_id=${encodeURIComponent(uid)}`
-      : `screen_name=${encodeURIComponent(handle)}`;
-    const res = await fetch('/i/api/1.1/friendships/destroy.json', {
-      method: 'POST',
-      headers: { ...headers, 'content-type': 'application/x-www-form-urlencoded' },
-      body,
-      credentials: 'include'
-    });
-    if (res.ok) return { success: true, via: 'v1.1' };
+    const cleanH = String(handle || '').replace(/^@/, '').trim();
 
-    const ids = await discoverAllQueryIds();
-    if (!uid) uid = await resolveUserId(handle, headers, ids);
-    const qid = ids.Unfollow || ids.UnfollowUser;
-    if (qid && uid) {
-      const gqlRes = await fetch(`/i/api/graphql/${qid}/Unfollow`, {
+    // 1. Try v1.1 destroy.json with user_id or screen_name + include_profile_interstitial_type=1
+    const bodyStr = uid
+      ? `user_id=${encodeURIComponent(uid)}&include_profile_interstitial_type=1`
+      : `screen_name=${encodeURIComponent(cleanH)}&include_profile_interstitial_type=1`;
+
+    try {
+      const res = await fetch('/i/api/1.1/friendships/destroy.json', {
         method: 'POST',
-        headers: { ...headers, 'content-type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({
-          variables: { user_id: uid, userId: uid },
-          queryId: qid
-        })
+        headers: { ...headers, 'content-type': 'application/x-www-form-urlencoded' },
+        body: bodyStr,
+        credentials: 'include'
       });
-      if (gqlRes.ok) return { success: true, via: 'gql' };
+      const data = await res.json().catch(() => null);
+      const hasErrors = Array.isArray(data?.errors) && data.errors.length > 0;
+      if (res.ok && data && !hasErrors && (data.id_str || data.screen_name || data.id)) {
+        return { success: true, via: 'v1.1' };
+      }
+    } catch (e) {}
+
+    // 2. Try GraphQL UnfollowUser mutation
+    try {
+      const ids = await discoverAllQueryIds();
+      if (!uid && cleanH) uid = await resolveUserId(cleanH, headers, ids);
+      const qid = ids.UnfollowUser || ids.Unfollow;
+      if (qid && uid) {
+        const gqlRes = await fetch(`/i/api/graphql/${qid}/UnfollowUser`, {
+          method: 'POST',
+          headers: { ...headers, 'content-type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            variables: { target_user_id: uid, user_id: uid },
+            queryId: qid
+          })
+        });
+        const gqlData = await gqlRes.json().catch(() => null);
+        const hasGqlErrors = Array.isArray(gqlData?.errors) && gqlData.errors.length > 0;
+        if (gqlRes.ok && gqlData && !hasGqlErrors && gqlData.data) {
+          return { success: true, via: 'gql' };
+        }
+      }
+    } catch (e) {}
+
+    // 3. Fallback v1.1 destroy.json with screen_name only
+    if (cleanH) {
+      try {
+        const res2 = await fetch('/i/api/1.1/friendships/destroy.json', {
+          method: 'POST',
+          headers: { ...headers, 'content-type': 'application/x-www-form-urlencoded' },
+          body: `screen_name=${encodeURIComponent(cleanH)}`,
+          credentials: 'include'
+        });
+        const is429 = res2.status === 429;
+        const data2 = await res2.json().catch(() => null);
+        const hasErrors2 = Array.isArray(data2?.errors) && data2.errors.length > 0;
+        const errDesc = hasErrors2 ? data2.errors[0].message : `HTTP ${res2.status}`;
+        if (is429 || /rate limit/i.test(errDesc)) {
+          return { success: false, isRateLimit: true, status: 429, error: errDesc || 'HTTP 429 Rate Limit' };
+        }
+        if (res2.ok && data2 && !hasErrors2 && (data2.id_str || data2.screen_name || data2.id)) {
+          return { success: true, via: 'v1.1_screen' };
+        }
+        return { success: false, error: errDesc };
+      } catch (err) {
+        return { success: false, error: err.message };
+      }
     }
-    let errText = '';
-    try { errText = await res.text(); } catch (e) {}
-    return { success: false, error: errText || ('status ' + res.status) };
+
+    return { success: false, error: 'Unfollow failed across all endpoints' };
   }
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -432,10 +407,53 @@
     }
   });
 
-  // Auto-inject widget after page loads
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', injectFloatingWidget);
-  } else {
-    injectFloatingWidget();
+  // ── Auto-run Live Unfollow Queue In-Page Worker ──
+  let inPageQueueBusy = false;
+  async function pollAndExecuteQueueInPage() {
+    if (inPageQueueBusy) return;
+    inPageQueueBusy = true;
+    try {
+      const res = await fetch('http://localhost:3001/api/x/pending_unfollows');
+      if (!res.ok) {
+        inPageQueueBusy = false;
+        return;
+      }
+      const data = await res.json();
+      if (data.isPaused || data.rateLimited || !data.tasks || data.tasks.length === 0) {
+        inPageQueueBusy = false;
+        return;
+      }
+
+      const task = data.tasks[0];
+      console.log(`⚡ [CleanSweep Live In-Page] Unfollowing @${task.handle}...`);
+      const resUnfollow = await unfollowInPage(task.handle, task.userId);
+      const isSuccess = !!resUnfollow?.success;
+      const is429 = !!resUnfollow?.isRateLimit || resUnfollow?.status === 429;
+      const errorMsg = resUnfollow?.error || (isSuccess ? '' : 'Failed');
+
+      await fetch('http://localhost:3001/api/x/unfollow_result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: task.userId,
+          handle: task.handle,
+          success: isSuccess,
+          error: errorMsg,
+          isRateLimit: is429,
+          clientVersion: 'v2.5'
+        })
+      });
+
+      await new Promise(r => setTimeout(r, 1900 + Math.random() * 700));
+    } catch (e) {
+    } finally {
+      inPageQueueBusy = false;
+    }
   }
+
+  setInterval(pollAndExecuteQueueInPage, 2500);
+
+  setTimeout(() => {
+    discoverAllQueryIds(true).catch(() => {});
+  }, 1200);
 })();

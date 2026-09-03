@@ -1,13 +1,17 @@
 import React from 'react';
-import { X, Download, UserMinus, ShieldCheck, PieChart, Sparkles } from 'lucide-react';
+import { X, Download, UserMinus, ShieldCheck, PieChart, Sparkles, RefreshCw } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import { useLanguage } from '../i18n/LanguageContext.jsx';
 
 export default function StatsModal({
   isOpen,
   onClose,
   unfollowedAccounts,
-  totalInitialFollowing
+  totalInitialFollowing,
+  queueStatus,
+  onSyncLiveDiff
 }) {
+  const { t } = useLanguage();
   if (!isOpen) return null;
 
   const handleConfetti = () => {
@@ -60,7 +64,7 @@ export default function StatsModal({
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <PieChart size={22} color="var(--accent-blue)" />
-            <h2 style={{ fontSize: '1.2rem', fontWeight: 800 }}>Feed Audit & Session Summary</h2>
+            <h2 style={{ fontSize: '1.2rem', fontWeight: 800 }}>{t('statsModal.title')}</h2>
           </div>
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer' }}>
             <X size={20} />
@@ -73,7 +77,7 @@ export default function StatsModal({
               {unfollowedAccounts.length}
             </div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600, marginTop: '2px' }}>
-              UNFOLLOWED
+              {t('statsModal.appMarked')}
             </div>
           </div>
 
@@ -82,7 +86,7 @@ export default function StatsModal({
               {unfollowedRatio}%
             </div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600, marginTop: '2px' }}>
-              FEED CLEANED
+              {t('statsModal.feedCleaned')}
             </div>
           </div>
 
@@ -91,7 +95,61 @@ export default function StatsModal({
               {totalInitialFollowing - unfollowedAccounts.length}
             </div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600, marginTop: '2px' }}>
-              KEPT FOLLOWING
+              {t('statsModal.keptFollowing')}
+            </div>
+          </div>
+        </div>
+
+        {/* Live Bridge & Execution Audit Section */}
+        <div style={{
+          background: 'var(--bg-card-hover)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 'var(--radius-md)',
+          padding: '12px 14px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '10px'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <RefreshCw size={15} color="#F59E0B" />
+              <span style={{ fontSize: '0.85rem', fontWeight: 700 }}>{t('statsModal.liveBridgeTitle')}</span>
+            </div>
+            {onSyncLiveDiff && (
+              <button
+                className="banner-btn"
+                onClick={async () => {
+                  try {
+                    await fetch('/api/x/resume_queue', { method: 'POST' });
+                  } catch (e) {}
+                  onSyncLiveDiff();
+                }}
+                title={t('statsModal.queueSyncTooltip')}
+              >
+                <RefreshCw size={12} />
+                <span>{t('statsModal.queueSyncBtn')}</span>
+              </button>
+            )}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', textAlign: 'center' }}>
+            <div style={{ background: 'var(--bg-card)', padding: '8px 4px', borderRadius: '6px', border: '1px solid var(--border-light)' }}>
+              <div style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--unfollow-red)', fontFamily: 'var(--font-mono)' }}>{unfollowedAccounts.length}</div>
+              <div style={{ fontSize: '0.68rem', color: 'var(--text-secondary)' }}>{t('statsModal.appMarked')}</div>
+            </div>
+            <div style={{ background: 'var(--bg-card)', padding: '8px 4px', borderRadius: '6px', border: '1px solid var(--border-light)' }}>
+              <div style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--keep-green)', fontFamily: 'var(--font-mono)' }}>{queueStatus?.completedCount || 0}</div>
+              <div style={{ fontSize: '0.68rem', color: 'var(--text-secondary)' }}>{t('statsModal.liveExecuted')}</div>
+            </div>
+            <div style={{ background: 'var(--bg-card)', padding: '8px 4px', borderRadius: '6px', border: '1px solid var(--border-light)' }}>
+              <div style={{ fontSize: '1.1rem', fontWeight: 700, color: '#F59E0B', fontFamily: 'var(--font-mono)' }}>{queueStatus?.pendingCount || 0}</div>
+              <div style={{ fontSize: '0.68rem', color: 'var(--text-secondary)' }}>{t('statsModal.inQueue')}</div>
+            </div>
+            <div style={{ background: 'var(--bg-card)', padding: '8px 4px', borderRadius: '6px', border: '1px solid var(--border-light)' }}>
+              <div style={{ fontSize: '1.1rem', fontWeight: 700, color: queueStatus?.isRateLimited ? 'var(--unfollow-red)' : 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                {queueStatus?.failedCount || 0}
+              </div>
+              <div style={{ fontSize: '0.68rem', color: 'var(--text-secondary)' }}>{queueStatus?.isRateLimited ? t('statsModal.rateLimitPause') : t('statsModal.failed')}</div>
             </div>
           </div>
         </div>
@@ -100,14 +158,14 @@ export default function StatsModal({
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-secondary)' }}>
-              UNFOLLOWED ACCOUNTS AUDIT LOG ({unfollowedAccounts.length})
+              {t('statsModal.auditLogTitle', { count: unfollowedAccounts.length })}
             </label>
             {unfollowedAccounts.length > 0 && (
               <button 
                 onClick={handleConfetti} 
                 style={{ background: 'transparent', border: 'none', color: '#FFD700', fontSize: '0.8rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
               >
-                <Sparkles size={14} /> Celebrate Clean Feed!
+                <Sparkles size={14} /> {t('statsModal.celebrateClean')}
               </button>
             )}
           </div>
@@ -115,7 +173,7 @@ export default function StatsModal({
           <div style={{ background: 'var(--bg-card-hover)', border: '1px solid var(--border-light)', borderRadius: 'var(--radius-md)', maxHeight: '160px', overflowY: 'auto', padding: '8px' }}>
             {unfollowedAccounts.length === 0 ? (
               <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px 0', fontSize: '0.85rem' }}>
-                No accounts unfollowed yet in this session.
+                {t('statsModal.noUnfollowedYet')}
               </div>
             ) : (
               unfollowedAccounts.map(acc => (
@@ -137,15 +195,15 @@ export default function StatsModal({
           <div style={{ display: 'flex', gap: '8px' }}>
             <button className="btn-secondary" onClick={handleExportCSV} disabled={unfollowedAccounts.length === 0} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem' }}>
               <Download size={14} />
-              <span>Export CSV</span>
+              <span>{t('statsModal.exportCSV')}</span>
             </button>
             <button className="btn-secondary" onClick={handleExportJSON} disabled={unfollowedAccounts.length === 0} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem' }}>
               <Download size={14} />
-              <span>Export JSON</span>
+              <span>{t('statsModal.exportJSON')}</span>
             </button>
           </div>
           <button className="btn-primary" onClick={onClose}>
-            Close Report
+            {t('statsModal.closeReport')}
           </button>
         </div>
       </div>

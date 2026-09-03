@@ -103,17 +103,21 @@
   function unwrapTweet(node) {
     if (!node || typeof node !== 'object') return null;
     let cur = node;
+    for (let i = 0; i < 6; i++) {
+      if (!cur || typeof cur !== 'object') return null;
+      if (cur.__typename === 'TweetTombstone' || cur.tombstone) return null;
+      if (cur.__typename === 'TweetWithVisibilityResults' && cur.tweet) { cur = cur.tweet; continue; }
+      if (cur.tweet && (cur.tweet.legacy || cur.tweet.note_tweet || cur.tweet.rest_id)) { cur = cur.tweet; continue; }
+      if (cur.result && typeof cur.result === 'object') { cur = cur.result; continue; }
+      break;
+    }
     if (cur.__typename === 'TweetTombstone' || cur.tombstone) return null;
-    if (cur.tweet) cur = cur.tweet;
-    if (cur.result && (cur.result.legacy || cur.result.tweet || cur.result.note_tweet)) cur = cur.result;
-    if (cur.tweet) cur = cur.tweet;
-    if (cur.__typename === 'TweetTombstone' || cur.tombstone) return null;
-    if (!cur.legacy && !cur.note_tweet) return null;
+    if (!cur.legacy && !cur.note_tweet && !(cur.full_text || cur.text)) return null;
     return cur;
   }
 
   function collectTweetNodes(root, out, depth) {
-    if (!root || (depth || 0) > 14) return out;
+    if (!root || (depth || 0) > 16) return out;
     if (!out) out = [];
     if (Array.isArray(root)) {
       for (let i = 0; i < root.length; i++) collectTweetNodes(root[i], out, (depth || 0) + 1);
@@ -122,17 +126,17 @@
     if (typeof root !== 'object') return out;
     if (root.promotedMetadata) return out;
     const entryId = String(root.entryId || '');
-    if (/cursor-|who-to-follow|promoted|pinned/i.test(entryId)) {
-      if (/cursor-|who-to-follow|promoted/i.test(entryId)) return out;
-    }
+    if (/cursor-|who-to-follow|promoted/i.test(entryId)) return out;
 
-    const result = (root.tweet_results && root.tweet_results.result) || (root.tweet_result && root.tweet_result.result);
+    const result = (root.tweet_results && root.tweet_results.result)
+      || (root.tweet_result && root.tweet_result.result)
+      || root.tweet;
     if (result) {
       const tweet = unwrapTweet(result);
       if (tweet) out.push(tweet);
     }
 
-    const keys = ['instructions', 'entries', 'items', 'item', 'content', 'itemContent', 'moduleItems'];
+    const keys = ['instructions', 'entries', 'items', 'item', 'content', 'itemContent', 'moduleItems', 'itemContents'];
     for (let i = 0; i < keys.length; i++) {
       if (root[keys[i]]) collectTweetNodes(root[keys[i]], out, (depth || 0) + 1);
     }
@@ -200,8 +204,43 @@
     return String(note || legacy.full_text || legacy.text || '').trim();
   }
 
+  function tweetUrlEntities(tweet) {
+    const legacy = tweet.legacy || tweet || {};
+    const note = (tweet.note_tweet && tweet.note_tweet.note_tweet_results && tweet.note_tweet.note_tweet_results.result)
+      || (tweet.note_tweet && tweet.note_tweet.result)
+      || {};
+    const urls = []
+      .concat((legacy.entities && legacy.entities.urls) || [])
+      .concat((tweet.entities && tweet.entities.urls) || [])
+      .concat((note.entity_set && note.entity_set.urls) || [])
+      .concat((note.entities && note.entities.urls) || []);
+    const seen = {};
+    const out = [];
+    for (let i = 0; i < urls.length; i++) {
+      const item = urls[i];
+      const key = (item && (item.url || item.expanded_url || item.unwound_url)) || '';
+      if (!key || seen[key]) continue;
+      seen[key] = true;
+      out.push(item);
+    }
+    return Object.assign({}, legacy.entities || tweet.entities || {}, { urls: out });
+  }
+
+  function expandUrlsInText(text, entities) {
+    let out = String(text || '');
+    const urls = (entities && entities.urls) || [];
+    for (let i = 0; i < urls.length; i++) {
+      const item = urls[i] || {};
+      const full = String(item.expanded_url || item.unwound_url || '').trim();
+      if (!full || /t\.co\//i.test(full)) continue;
+      const short = item.url || item.short_url || '';
+      if (short && out.indexOf(short) !== -1) out = out.split(short).join(full);
+    }
+    return out;
+  }
+
   function toRawTweet(tweet) {
-    const legacy = tweet.legacy || {};
+    const legacy = tweet.legacy || tweet;
     return {
       id_str: tweet.rest_id || legacy.id_str,
       rest_id: tweet.rest_id || legacy.id_str,
@@ -210,14 +249,17 @@
       favorite_count: legacy.favorite_count || 0,
       retweet_count: legacy.retweet_count || 0,
       reply_count: legacy.reply_count || 0,
-      in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+      in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || legacy.in_reply_to_status_id || null,
       in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
       in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+      conversation_id_str: legacy.conversation_id_str || null,
+      display_text_range: legacy.display_text_range || null,
+      self_thread: legacy.self_thread || null,
       is_quote_status: legacy.is_quote_status,
       retweeted_status: legacy.retweeted_status_result || legacy.retweeted_status || null,
       quoted_status: tweet.quoted_status_result || legacy.quoted_status || null,
       quoted_status_result: tweet.quoted_status_result || null,
-      entities: legacy.entities,
+      entities: tweetUrlEntities(tweet),
       extended_entities: legacy.extended_entities,
       user: {
         screen_name: authorHandleOf(tweet),
@@ -232,9 +274,7 @@
     const instructions = timelineInstructions(data);
     const nodes = [];
     for (let i = 0; i < instructions.length; i++) {
-      const inst = instructions[i];
-      if (inst && inst.type === 'TimelinePinEntry') continue;
-      collectTweetNodes(inst, nodes, 0);
+      collectTweetNodes(instructions[i], nodes, 0);
     }
     const out = [];
     const seen = {};
@@ -306,21 +346,32 @@
     const author = normalizeHandle(t._author || (t.user && t.user.screen_name));
     const authorId = String(t._authorId || (t.user && t.user.id_str) || '');
     if (author && lower && author !== lower) return false;
-    if (userId && authorId && /^\d+$/.test(String(userId)) && authorId && authorId !== String(userId) && author && author !== lower) return false;
+    if (userId && authorId && /^\d+$/.test(String(userId)) && authorId !== String(userId)) return false;
     return true;
   }
 
   function isReplyToOthers(t, handle, userId) {
     const lower = normalizeHandle(handle);
-    const replyStatus = t.in_reply_to_status_id_str || t.in_reply_to_status_id || null;
     const replyUser = normalizeHandle(t.in_reply_to_screen_name);
     const replyUid = t.in_reply_to_user_id_str ? String(t.in_reply_to_user_id_str) : '';
-    if (!replyStatus && !replyUser && !replyUid) return false;
-    if (replyUser && replyUser === lower) return false;
-    if (userId && replyUid && String(userId) === replyUid) return false;
-    if (replyUser && replyUser !== lower) return true;
-    if (replyUid && userId && replyUid !== String(userId)) return true;
-    return Boolean(replyStatus);
+    const replyStatus = t.in_reply_to_status_id_str || t.in_reply_to_status_id || null;
+    const hasReplyPtr = Boolean(replyStatus || replyUser || replyUid);
+    if (hasReplyPtr) {
+      const toSelf = (replyUser && lower && replyUser === lower)
+        || (userId && replyUid && String(userId) === replyUid);
+      if (!toSelf) return true;
+    }
+    const range = t.display_text_range;
+    const mentions = (t.entities && t.entities.user_mentions) || [];
+    if (Array.isArray(range) && range[0] > 0) {
+      for (let i = 0; i < mentions.length; i++) {
+        const m = mentions[i];
+        if (!m || !Array.isArray(m.indices) || m.indices[0] !== 0) continue;
+        const mention = normalizeHandle(m.screen_name);
+        if (mention && mention !== lower) return true;
+      }
+    }
+    return false;
   }
 
   function formatAndFilterTweets(rawTweets, handle, userId) {
@@ -341,6 +392,8 @@
       const mediaUrl = (t.entities && t.entities.media && t.entities.media[0] && t.entities.media[0].url)
         || (t.extended_entities && t.extended_entities.media && t.extended_entities.media[0] && t.extended_entities.media[0].url);
       if (mediaUrl && text.endsWith(mediaUrl)) text = text.replace(mediaUrl, '').trim();
+      const entities = tweetUrlEntities(t);
+      text = expandUrlsInText(text, entities);
       const act = formatExactActivityTime(t.created_at);
       const media = (t.extended_entities && t.extended_entities.media && t.extended_entities.media[0])
         || (t.entities && t.entities.media && t.entities.media[0]);
@@ -356,7 +409,8 @@
         isRT: false,
         isReply: false,
         isQuote: Boolean(t.is_quote_status || t.quoted_status || t.quoted_status_result),
-        replyTo: null
+        replyTo: null,
+        entities: entities
       });
       if (out.length >= 3) break;
     }

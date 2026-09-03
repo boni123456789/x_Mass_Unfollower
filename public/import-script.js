@@ -279,7 +279,7 @@
                   screen_name: screen_name || name,
                   profile_image_url_https: legacy.profile_image_url_https || userObj.avatar || '',
                   profile_banner_url: legacy.profile_banner_url || '',
-                  description: legacy.description || '',
+                  description: legacy.description || userObj.profile_bio?.description || '',
                   followers_count: legacy.followers_count || 0,
                   friends_count: legacy.friends_count || 0,
                   created_at: legacy.created_at || userObj.core?.created_at || '',
@@ -288,7 +288,8 @@
                   verified: legacy.verified || userObj.is_blue_verified || false,
                   followed_by: legacy.followed_by || false,
                   status: statusObj,
-                  entities: legacy.entities,
+                  entities: legacy.entities || userObj.profile_bio?.entities || null,
+                  profile_bio: userObj.profile_bio || null,
                   core: userObj.core || null
                 });
                 foundUsers = true;
@@ -465,11 +466,19 @@
         .filter((t) => t && (t.full_text || t.text))
         .map((t) => {
           let text = String(t.full_text || t.text).trim();
+          const urls = (t.entities && t.entities.urls) || [];
+          for (let ui = 0; ui < urls.length; ui++) {
+            const item = urls[ui] || {};
+            const full = String(item.expanded_url || item.unwound_url || '').trim();
+            const short = item.url || item.short_url || '';
+            if (full && short && !/t\.co\//i.test(full) && text.indexOf(short) !== -1) {
+              text = text.split(short).join(full);
+            }
+          }
           const isRT = Boolean(t.retweeted_status || /^rt\s+@/i.test(text));
           const replyUser = String(t.in_reply_to_screen_name || '').replace(/^@/, '').toLowerCase();
           const isReply = Boolean(
-            (t.in_reply_to_status_id_str || t.in_reply_to_status_id)
-            && replyUser
+            (t.in_reply_to_status_id_str || t.in_reply_to_status_id || t.in_reply_to_user_id_str || replyUser)
             && replyUser !== lowerHandle
           );
           const isQuote = Boolean(t.is_quote_status || t.quoted_status);
@@ -500,34 +509,112 @@
         const res = await fetch('http://localhost:3001/api/x/pending_unfollows');
         if (res.ok) {
           const data = await res.json();
+          if (data.rateLimited) {
+            console.log(`⏳ CleanSweep X: Rate-Limit auf X.com aktiv. Pausiere Live-Entfolgen für ${Math.round(data.resetInMs / 1000)}s...`);
+            return;
+          }
+
           const tasks = data.tasks || [];
           for (const task of tasks) {
-            console.log(`🚫 Führte Live-Entfolgen aus für @${task.handle} (${task.userId})...`);
+            console.log(`🚫 Führte Live-Entfolgen aus für @${task.handle} (${task.userId || 'screen_name'})...`);
             const ct0Token = document.cookie.match(/ct0=([^;]+)/)?.[1] || ct0;
-            const unfollowRes = await fetch('https://x.com/i/api/1.1/friendships/destroy.json', {
-              method: 'POST',
-              headers: {
-                'content-type': 'application/x-www-form-urlencoded',
-                'x-csrf-token': ct0Token,
-                'x-twitter-active-user': 'yes',
-                'x-twitter-auth-type': 'OAuth2Session'
-              },
-              body: 'user_id=' + encodeURIComponent(task.userId)
-            });
 
-            const isSuccess = unfollowRes.ok;
+            const normId = task.userId && /^\d+$/.test(String(task.userId)) ? String(task.userId) : '';
+            const normHandle = String(task.handle || '').replace(/^@/, '').trim();
+
+            let isSuccess = false;
+            let isRateLimit = false;
             let errText = '';
-            if (!isSuccess) {
-              errText = await unfollowRes.text();
+            let status = 0;
+
+            // Attempt 1: Primary GraphQL UnfollowUser (Modern X API)
+            if (normId) {
+              try {
+                const gqlRes = await fetch('https://x.com/i/api/graphql/2p1D3x6R-0a5uXzQ6G0V9w/UnfollowUser', {
+                  method: 'POST',
+                  headers: {
+                    'authorization': BEARER,
+                    'content-type': 'application/json',
+                    'x-csrf-token': ct0Token,
+                    'x-twitter-active-user': 'yes',
+                    'x-twitter-auth-type': 'OAuth2Session'
+                  },
+                  body: JSON.stringify({ variables: { target_user_id: normId }, queryId: '2p1D3x6R-0a5uXzQ6G0V9w' })
+                });
+                status = gqlRes.status;
+                const gqlData = await gqlRes.json().catch(() => null);
+                const hasGqlErr = Array.isArray(gqlData?.errors) && gqlData.errors.length > 0;
+                const unfollowObj = gqlData?.data?.unfollow_user || gqlData?.data?.unfollow || gqlData?.data?.destroy_friendship;
+
+                if (status === 429) {
+                  isRateLimit = true;
+                  errText = 'GraphQL Rate Limit (429)';
+                } else if (gqlRes.ok && gqlData && !hasGqlErr && unfollowObj) {
+                  isSuccess = true;
+                }
+              } catch (e) {
+                errText = e.message;
+              }
+            }
+
+            // Attempt 2: Fallback REST v1.1 destroy.json ONLY if GraphQL was not successful and no 429
+            if (!isSuccess && !isRateLimit) {
+              try {
+                const bodyPayload = (normId && normHandle)
+                  ? `user_id=${encodeURIComponent(normId)}&screen_name=${encodeURIComponent(normHandle)}&include_profile_interstitial_type=1`
+                  : (normId ? `user_id=${encodeURIComponent(normId)}&include_profile_interstitial_type=1` : `screen_name=${encodeURIComponent(normHandle)}&include_profile_interstitial_type=1`);
+
+                const unfollowRes = await fetch('https://x.com/i/api/1.1/friendships/destroy.json', {
+                  method: 'POST',
+                  headers: {
+                    'authorization': BEARER,
+                    'content-type': 'application/x-www-form-urlencoded',
+                    'x-csrf-token': ct0Token,
+                    'x-twitter-active-user': 'yes',
+                    'x-twitter-auth-type': 'OAuth2Session'
+                  },
+                  body: bodyPayload
+                });
+
+                status = unfollowRes.status;
+                const resJson = await unfollowRes.json().catch(() => null);
+                const hasErrors = Array.isArray(resJson?.errors) && resJson.errors.length > 0;
+                const v1ErrText = hasErrors ? resJson.errors[0].message : '';
+                if (status === 429 || /rate limit/i.test(v1ErrText)) {
+                  isRateLimit = true;
+                  errText = v1ErrText || 'HTTP 429 Rate Limit';
+                } else if (unfollowRes.ok && resJson && !hasErrors && resJson.following === false) {
+                  isSuccess = true;
+                }
+              } catch (e) {
+                if (!errText) errText = e.message;
+              }
+            }
+
+            if (isSuccess) {
+              console.log(`  ✅ @${task.handle} erfolgreich entfolgt (verifiziert)!`);
+            } else {
+              console.warn(`  ❌ Entfolgen von @${task.handle} VERFEHLT:`, errText || (isRateLimit ? 'HTTP 429 Rate Limit' : `Status ${status}`));
             }
 
             try {
               await fetch('http://localhost:3001/api/x/unfollow_result', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ userId: task.userId, handle: task.handle, success: isSuccess, error: errText })
+                body: JSON.stringify({
+                  userId: task.userId,
+                  handle: task.handle,
+                  success: isSuccess,
+                  error: isSuccess ? '' : (errText || (isRateLimit ? 'HTTP 429 Rate Limit' : `HTTP ${status} (following was not false)`)),
+                  isRateLimit,
+                  clientVersion: 'v2.5'
+                })
               });
             } catch (e) {}
+
+            // Stop processing remaining batch if we hit a rate limit
+            if (isRateLimit) break;
+            await new Promise((r) => setTimeout(r, 2500 + Math.random() * 1500));
           }
         }
       } catch (err) {}

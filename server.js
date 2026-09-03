@@ -1,14 +1,80 @@
 import express from 'express';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import { expandUrlsInText, fullUrlFromEntity, tweetUrlEntities, unwrapRedirectUrl } from './src/utils/expandUrls.js';
 
 const app = express();
 const PORT = 3001;
 
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-csrf-token');
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ─── In-Memory Session Store & Live Bridge Queue ──────────────────────────────
+const SESSION_FILE = path.join(process.cwd(), 'imported_session.json');
+
+// ─── Persistent & In-Memory Session Store & Live Bridge Queue ─────────────────
 let importedSession = null;
+try {
+  if (fs.existsSync(SESSION_FILE)) {
+    const fileData = fs.readFileSync(SESSION_FILE, 'utf8');
+    importedSession = JSON.parse(fileData);
+    console.log(`📂 DISK SESSION LOADED: ${importedSession?.following?.length || 0} following accounts found for @${importedSession?.profile?.screen_name || 'user'}`);
+  }
+} catch (err) {
+  console.error('⚠️ Could not load saved session from disk:', err.message);
+}
+
+// ─── Persistent Queue & Live Bridge Queue ──────────────────────────────
+const QUEUE_FILE = path.join(process.cwd(), 'unfollow_queue.json');
+
+let queueState = {
+  pending: [],    // [{ userId, handle, timestamp, retries }]
+  failed: [],     // [{ userId, handle, timestamp, error, isRateLimit }]
+  completed: [],  // [{ userId, handle, timestamp }]
+  rateLimitUntil: 0,
+  isPaused: false
+};
+
+function loadQueue() {
+  try {
+    if (fs.existsSync(QUEUE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+      queueState = {
+        pending: Array.isArray(data.pending) ? data.pending : [],
+        failed: Array.isArray(data.failed) ? data.failed : [],
+        completed: Array.isArray(data.completed) ? data.completed : [],
+        rateLimitUntil: data.rateLimitUntil || 0,
+        isPaused: Boolean(data.isPaused || false)
+      };
+      console.log(`📂 QUEUE LOADED: ${queueState.pending.length} pending, ${queueState.failed.length} failed, ${queueState.completed.length} completed, isPaused: ${queueState.isPaused}`);
+    }
+  } catch (err) {
+    console.error('⚠️ Could not load queue file from disk:', err.message);
+  }
+}
+
+function saveQueue() {
+  try {
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify(queueState, null, 2), 'utf8');
+  } catch (err) {
+    console.error('⚠️ Could not save queue to disk:', err.message);
+  }
+}
+
+loadQueue();
+
 let pendingUnfollows = [];
 let unfollowResults = [];
 
@@ -95,10 +161,43 @@ app.post('/api/x/import', async (req, res) => {
     importedAt: Date.now()
   };
 
+  try {
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(importedSession, null, 2), 'utf8');
+    console.log(`💾 Saved imported session to disk: ${SESSION_FILE}`);
+  } catch (e) {
+    console.error('⚠️ Failed to save session to disk:', e.message);
+  }
+
   console.log(`\n✅ IMPORT: @${profile.screen_name} — ${following.length} following accounts`);
   console.log(`   Bearer: ${(bearer || 'fallback').substring(0, 40)}...`);
 
-  return res.json({ success: true, handle: profile.screen_name, count: following.length });
+  const warmCodes = [];
+  for (const u of following) {
+    const desc = u.description || u.legacy?.description || '';
+    const matches = String(desc).matchAll(/t\.co\/([A-Za-z0-9]+)/gi);
+    for (const m of matches) warmCodes.push(m[1]);
+  }
+  resolveTcoCodes(warmCodes, 60).catch(() => {});
+
+  const reverifyRes = reverifyCompletedQueue();
+
+  return res.json({ success: true, handle: profile.screen_name, count: following.length, reverified: reverifyRes });
+});
+
+// ─── LOGOUT & CLEAR CACHE ──────────────────────────────────────────────────────
+app.post('/api/x/logout', (req, res) => {
+  importedSession = null;
+  pendingUnfollows = [];
+  unfollowResults = [];
+  try {
+    if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
+  } catch (e) {}
+  console.log('🧹 Session cleared on server.');
+  return res.json({ success: true });
+});
+
+app.post('/api/x/clear_cache', (req, res) => {
+  return res.json({ success: true });
 });
 
 function formatExactActivityTime(createdAtStr) {
@@ -145,36 +244,42 @@ function formatExactActivityTime(createdAtStr) {
   };
 }
 
+function previewFromStatus(status, handle) {
+  if (!status) return [];
+  const legacy = status.legacy || status;
+  const entities = tweetUrlEntities(status);
+  let text = expandUrlsInText(String(legacy.full_text || legacy.text || status.full_text || status.text || '').trim(), entities);
+  if (!text) return [];
+  if (legacy.retweeted_status || legacy.retweeted_status_result || /^rt\s+@/i.test(text)) return [];
+  const replyUser = String(legacy.in_reply_to_screen_name || '').replace(/^@/, '').toLowerCase();
+  const own = String(handle || '').replace(/^@/, '').toLowerCase();
+  if (legacy.in_reply_to_status_id_str || legacy.in_reply_to_status_id || legacy.in_reply_to_user_id_str) {
+    if (!(replyUser && own && replyUser === own)) return [];
+  }
+  if (replyUser && own && replyUser !== own) return [];
+  const act = formatExactActivityTime(legacy.created_at || status.created_at);
+  const media = legacy.extended_entities?.media?.[0] || legacy.entities?.media?.[0];
+  return [{
+    id: String(status.rest_id || legacy.id_str || status.id_str || ''),
+    text,
+    createdAt: act.text,
+    relativeTime: act.relativeText,
+    likes: legacy.favorite_count || 0,
+    retweets: legacy.retweet_count || 0,
+    replies: legacy.reply_count || 0,
+    image: media?.media_url_https || '',
+    isRT: false,
+    isReply: false,
+    isQuote: Boolean(legacy.is_quote_status || status.quoted_status_result),
+    replyTo: null,
+    entities
+  }];
+}
+
 // ─── IMPORTED: Return stored import data to the frontend ────────────────────────
 app.get('/api/x/imported', async (req, res) => {
   if (!importedSession) {
     return res.status(404).json({ error: 'No imported session. Run the import script on x.com first.' });
-  }
-
-  function expandUrlsInText(text, urlEntities) {
-    if (!text) return '';
-    let out = String(text);
-    const urls = Array.isArray(urlEntities) ? [...urlEntities] : [];
-    urls.sort((a, b) => String(b?.url || '').length - String(a?.url || '').length);
-    for (const item of urls) {
-      const full = item?.expanded_url || item?.unwound_url || (item?.display_url ? `https://${String(item.display_url).replace(/^https?:\/\//i, '')}` : '');
-      if (!full) continue;
-      const candidates = new Set();
-      if (item.url) {
-        candidates.add(item.url);
-        candidates.add(String(item.url).replace(/^https?:\/\//i, ''));
-      }
-      const tco = String(item.url || item.display_url || '').match(/t\.co\/([A-Za-z0-9]+)/i);
-      if (tco) {
-        candidates.add(`t.co/${tco[1]}`);
-        candidates.add(`https://t.co/${tco[1]}`);
-        candidates.add(`http://t.co/${tco[1]}`);
-      }
-      for (const shortUrl of candidates) {
-        if (shortUrl && out.includes(shortUrl)) out = out.split(shortUrl).join(full);
-      }
-    }
-    return out;
   }
 
   function pickUrlEntity(entities) {
@@ -190,21 +295,22 @@ app.get('/api/x/imported', async (req, res) => {
   }
 
   const profile = importedSession.profile || {};
-  const formattedAccounts = (importedSession.following || []).map((u) => {
+  const followingList = importedSession.following || [];
+  const formattedAccounts = followingList.map((u) => {
     const legacy = u.legacy || {};
     const core = u.core || legacy.core || {};
     const name = u.name || legacy.name || core.name || u.screen_name || legacy.screen_name || 'Unbekannt';
     const handle = u.screen_name || legacy.screen_name || core.screen_name || u.name || legacy.name || 'user';
     const lastTweet = u.status || legacy.status || null;
     const activityInfo = formatExactActivityTime(lastTweet?.created_at);
-    const entities = legacy.entities || u.entities || {};
-    const bioRaw = legacy.description || u.description || '';
-    const bio = expandUrlsInText(bioRaw, entities.description?.urls || entities.urls);
+    const entities = legacy.entities || u.entities || u.profile_bio?.entities || {};
+    const bioRaw = legacy.description || u.description || u.profile_bio?.description || '';
+    const bio = expandUrlsInText(bioRaw, entities, tcoCache);
     const urlEnt = pickUrlEntity(entities);
-    let website = urlEnt?.expanded_url || urlEnt?.unwound_url || '';
-    if (!website) {
-      const rawUrl = legacy.url || u.url || '';
-      if (rawUrl && !/t\.co\//i.test(rawUrl)) website = rawUrl;
+    let website = fullUrlFromEntity(urlEnt) || legacy.url || u.url || '';
+    if (website && /t\.co\//i.test(website)) {
+      const code = String(website).match(/t\.co\/([A-Za-z0-9]+)/i)?.[1];
+      if (code && tcoCache[code]) website = tcoCache[code];
     }
     const websiteDisplay = urlEnt?.display_url || (website ? website.replace(/^https?:\/\//i, '').replace(/\/$/, '') : '');
     const location = legacy.location || u.location || core.location || u.location_data?.location || '';
@@ -237,8 +343,16 @@ app.get('/api/x/imported', async (req, res) => {
         lastInteraction: null,
         dataUnavailable: true
       },
-      tweets: [],
-      tweetSource: 'none',
+      tweets: previewFromStatus(lastTweet, handle),
+      lastActivityNote: (() => {
+        if (!lastTweet) return '';
+        const isRT = Boolean(lastTweet.retweeted_status || lastTweet.retweeted_status_result || /^rt\s+@/i.test(lastTweet.full_text || lastTweet.text || ''));
+        const isReply = Boolean(lastTweet.in_reply_to_status_id_str || lastTweet.in_reply_to_status_id || lastTweet.in_reply_to_user_id_str);
+        if (isRT) return `Letzte Aktivität war ein Retweet (${activityInfo.dateStr || activityInfo.relativeText})`;
+        if (isReply) return `Letzte Aktivität war eine Antwort (${activityInfo.dateStr || activityInfo.relativeText})`;
+        return '';
+      })(),
+      tweetSource: lastTweet ? 'import_status' : 'none',
       entities: entities
     };
   });
@@ -276,21 +390,83 @@ app.post('/api/x/logout', (req, res) => {
   return res.json({ success: true, message: 'Session and server cache successfully cleared.' });
 });
 
+const tcoCache = {};
+const TCO_HEADERS = {
+  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  'accept': 'text/html,application/xhtml+xml',
+  'accept-language': 'en-US,en;q=0.9'
+};
+
+function isExpandedHttpUrl(value) {
+  return /^https?:\/\//i.test(value || '') && !/t\.co\//i.test(value);
+}
+
+async function resolveTcoCode(code) {
+  const key = String(code || '');
+  if (!/^[A-Za-z0-9]+$/.test(key)) return '';
+  if (isExpandedHttpUrl(tcoCache[key])) return tcoCache[key];
+  let url = `https://t.co/${key}`;
+  try {
+    for (let hop = 0; hop < 6; hop++) {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 4000);
+      let r;
+      try {
+        r = await fetch(url, { method: 'GET', redirect: 'manual', headers: TCO_HEADERS, signal: ac.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      const loc = r.headers.get('location');
+      if (loc) {
+        const next = loc.startsWith('http') ? loc : new URL(loc, url).href;
+        const unwrapped = unwrapRedirectUrl(next);
+        if (isExpandedHttpUrl(unwrapped)) {
+          tcoCache[key] = unwrapped;
+          return unwrapped;
+        }
+        url = unwrapped || next;
+        continue;
+      }
+      if (r.url && isExpandedHttpUrl(r.url)) {
+        const unwrapped = unwrapRedirectUrl(r.url);
+        tcoCache[key] = unwrapped;
+        return unwrapped;
+      }
+      if (r.status >= 200 && r.status < 300) {
+        const html = await r.text();
+        const found = html.match(/http-equiv=["']refresh["'][^>]*url=([^"'\s>]+)/i)
+          || html.match(/<a[^>]+href=["'](https?:\/\/[^"']+)["']/i);
+        if (found?.[1]) {
+          const unwrapped = unwrapRedirectUrl(found[1]);
+          if (isExpandedHttpUrl(unwrapped)) {
+            tcoCache[key] = unwrapped;
+            return unwrapped;
+          }
+        }
+      }
+      break;
+    }
+  } catch {}
+  return tcoCache[key] || '';
+}
+
+async function resolveTcoCodes(codes, limit = 24) {
+  const unique = [...new Set((codes || []).filter((c) => /^[A-Za-z0-9]+$/.test(String(c))))].slice(0, limit);
+  const missing = unique.filter((c) => !isExpandedHttpUrl(tcoCache[c]));
+  for (let i = 0; i < missing.length; i += 8) {
+    const chunk = missing.slice(i, i + 8);
+    await Promise.all(chunk.map((code) => resolveTcoCode(code)));
+  }
+  const urls = {};
+  for (const code of unique) {
+    if (isExpandedHttpUrl(tcoCache[code])) urls[code] = tcoCache[code];
+  }
+  return urls;
+}
+
 app.post('/api/x/expand_tco', async (req, res) => {
   const codes = Array.isArray(req.body?.codes) ? req.body.codes : [];
-  const urls = {};
-  for (const code of codes.slice(0, 8)) {
-    if (!/^[A-Za-z0-9]+$/.test(String(code))) continue;
-    try {
-      const r = await fetch(`https://t.co/${code}`, { method: 'GET', redirect: 'manual' });
-      const loc = r.headers.get('location');
-      if (loc && !/t\.co\//i.test(loc)) urls[code] = loc;
-      else {
-        const r2 = await fetch(`https://t.co/${code}`, { redirect: 'follow' });
-        if (r2.url && !/t\.co\//i.test(r2.url)) urls[code] = r2.url;
-      }
-    } catch {}
-  }
+  const urls = await resolveTcoCodes(codes, 24);
   return res.json({ urls });
 });
 
@@ -368,17 +544,21 @@ function parseMissingFeatures(data) {
 function unwrapTweet(node) {
   if (!node || typeof node !== 'object') return null;
   let cur = node;
+  for (let i = 0; i < 6; i++) {
+    if (!cur || typeof cur !== 'object') return null;
+    if (cur.__typename === 'TweetTombstone' || cur.tombstone) return null;
+    if (cur.__typename === 'TweetWithVisibilityResults' && cur.tweet) { cur = cur.tweet; continue; }
+    if (cur.tweet && (cur.tweet.legacy || cur.tweet.note_tweet || cur.tweet.rest_id)) { cur = cur.tweet; continue; }
+    if (cur.result && typeof cur.result === 'object') { cur = cur.result; continue; }
+    break;
+  }
   if (cur.__typename === 'TweetTombstone' || cur.tombstone) return null;
-  if (cur.tweet) cur = cur.tweet;
-  if (cur.result && (cur.result.legacy || cur.result.tweet || cur.result.note_tweet)) cur = cur.result;
-  if (cur.tweet) cur = cur.tweet;
-  if (cur.__typename === 'TweetTombstone' || cur.tombstone) return null;
-  if (!cur.legacy && !cur.note_tweet) return null;
+  if (!cur.legacy && !cur.note_tweet && !(cur.full_text || cur.text)) return null;
   return cur;
 }
 
 function collectTweetNodes(root, out = [], depth = 0) {
-  if (!root || depth > 14) return out;
+  if (!root || depth > 16) return out;
   if (Array.isArray(root)) {
     for (const item of root) collectTweetNodes(item, out, depth + 1);
     return out;
@@ -387,12 +567,12 @@ function collectTweetNodes(root, out = [], depth = 0) {
   if (root.promotedMetadata) return out;
   const entryId = String(root.entryId || '');
   if (/cursor-|who-to-follow|promoted/i.test(entryId)) return out;
-  const result = root.tweet_results?.result || root.tweet_result?.result;
+  const result = root.tweet_results?.result || root.tweet_result?.result || root.tweet;
   if (result) {
     const tweet = unwrapTweet(result);
     if (tweet) out.push(tweet);
   }
-  for (const k of ['instructions', 'entries', 'items', 'item', 'content', 'itemContent', 'moduleItems']) {
+  for (const k of ['instructions', 'entries', 'items', 'item', 'content', 'itemContent', 'moduleItems', 'itemContents']) {
     if (root[k]) collectTweetNodes(root[k], out, depth + 1);
   }
   return out;
@@ -419,8 +599,9 @@ function authorIdOf(tweet) {
 }
 
 function toRawTweet(tweet) {
-  const legacy = tweet.legacy || {};
+  const legacy = tweet.legacy || tweet;
   const note = tweet.note_tweet?.note_tweet_results?.result?.text;
+  const entities = tweetUrlEntities(tweet);
   return {
     id_str: tweet.rest_id || legacy.id_str,
     full_text: String(note || legacy.full_text || legacy.text || '').trim(),
@@ -428,14 +609,17 @@ function toRawTweet(tweet) {
     favorite_count: legacy.favorite_count || 0,
     retweet_count: legacy.retweet_count || 0,
     reply_count: legacy.reply_count || 0,
-    in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+    in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || legacy.in_reply_to_status_id || null,
     in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
     in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+    conversation_id_str: legacy.conversation_id_str || null,
+    display_text_range: legacy.display_text_range || null,
+    self_thread: legacy.self_thread || null,
     is_quote_status: legacy.is_quote_status,
     retweeted_status: legacy.retweeted_status_result || legacy.retweeted_status || null,
     quoted_status: tweet.quoted_status_result || legacy.quoted_status || null,
     quoted_status_result: tweet.quoted_status_result || null,
-    entities: legacy.entities,
+    entities,
     extended_entities: legacy.extended_entities,
     user: { screen_name: authorHandleOf(tweet), id_str: authorIdOf(tweet) },
     _author: authorHandleOf(tweet),
@@ -447,7 +631,6 @@ function tweetsFromGraphQL(data) {
   const instructions = timelineInstructions(data);
   const nodes = [];
   for (const inst of instructions) {
-    if (inst?.type === 'TimelinePinEntry') continue;
     collectTweetNodes(inst, nodes, 0);
   }
   const out = [];
@@ -483,38 +666,53 @@ function isRetweet(t) {
   return Boolean(t.retweeted_status || t.retweeted_status_result || /^rt\s+@/i.test(String(t.full_text || t.text || '')));
 }
 
-function isOwnTweet(t, handle) {
+function isOwnTweet(t, handle, userId) {
   const lower = normalizeHandle(handle);
   const author = normalizeHandle(t._author || t.user?.screen_name);
+  const authorId = String(t._authorId || t.user?.id_str || '');
   if (author && lower && author !== lower) return false;
+  if (userId && authorId && /^\d+$/.test(String(userId)) && authorId !== String(userId)) return false;
   return true;
 }
 
-function isReplyToOthers(t, handle) {
+function isReplyToOthers(t, handle, userId) {
   const lower = normalizeHandle(handle);
-  const replyStatus = t.in_reply_to_status_id_str || t.in_reply_to_status_id || null;
   const replyUser = normalizeHandle(t.in_reply_to_screen_name);
-  if (!replyStatus && !replyUser && !t.in_reply_to_user_id_str) return false;
-  if (replyUser && replyUser === lower) return false;
-  if (replyUser && replyUser !== lower) return true;
-  return Boolean(replyStatus);
+  const replyUid = t.in_reply_to_user_id_str ? String(t.in_reply_to_user_id_str) : '';
+  const replyStatus = t.in_reply_to_status_id_str || t.in_reply_to_status_id || null;
+  const hasReplyPtr = Boolean(replyStatus || replyUser || replyUid);
+  if (hasReplyPtr) {
+    const toSelf = (replyUser && lower && replyUser === lower)
+      || (userId && replyUid && String(userId) === replyUid);
+    if (!toSelf) return true;
+  }
+  const range = t.display_text_range;
+  const mentions = t.entities?.user_mentions || [];
+  if (Array.isArray(range) && range[0] > 0) {
+    const lead = mentions.find((m) => Array.isArray(m.indices) && m.indices[0] === 0);
+    const mention = normalizeHandle(lead?.screen_name);
+    if (mention && mention !== lower) return true;
+  }
+  return false;
 }
 
-function formatAndFilterTweets(rawTweets, handle) {
+function formatAndFilterTweets(rawTweets, handle, userId) {
   if (!Array.isArray(rawTweets)) return [];
   const seen = {};
   const out = [];
   for (const t of rawTweets) {
     if (!t || !(t.full_text || t.text)) continue;
-    if (!isOwnTweet(t, handle)) continue;
+    if (!isOwnTweet(t, handle, userId)) continue;
     if (isRetweet(t)) continue;
-    if (isReplyToOthers(t, handle)) continue;
+    if (isReplyToOthers(t, handle, userId)) continue;
     const id = String(t.id_str || t.rest_id || t.id || '');
     if (id && seen[id]) continue;
     if (id) seen[id] = true;
     let text = String(t.full_text || t.text).trim();
     const mediaUrl = t.entities?.media?.[0]?.url || t.extended_entities?.media?.[0]?.url;
     if (mediaUrl && text.endsWith(mediaUrl)) text = text.replace(mediaUrl, '').trim();
+    const entities = tweetUrlEntities(t);
+    text = expandUrlsInText(text, entities);
     const act = formatExactActivityTime(t.created_at);
     const media = t.extended_entities?.media?.[0] || t.entities?.media?.[0];
     out.push({
@@ -529,7 +727,8 @@ function formatAndFilterTweets(rawTweets, handle) {
       isRT: false,
       isReply: false,
       isQuote: Boolean(t.is_quote_status || t.quoted_status || t.quoted_status_result),
-      replyTo: null
+      replyTo: null,
+      entities
     });
     if (out.length >= 3) break;
   }
@@ -555,6 +754,10 @@ async function xAuthedFetch(url) {
     const response = await fetch(url, {
       headers: buildHeaders(importedSession.auth_token, importedSession.ct0)
     });
+    if (response.status === 429) {
+      console.warn('⚠️ X API Rate limit hit (429)!');
+      return { ok: false, status: 429, rateLimited: true, data: null };
+    }
     let data = null;
     try { data = await response.json(); } catch {}
     return { ok: response.ok, status: response.status, data };
@@ -573,6 +776,9 @@ async function gqlAuthedWithRetry(buildUrl, features) {
   let feats = { ...features };
   for (let attempt = 0; attempt < 4; attempt++) {
     const result = await gqlAuthed(buildUrl(feats));
+    if (result?.rateLimited) {
+      return { rateLimited: true };
+    }
     const data = result?.data;
     const missing = parseMissingFeatures(data);
     if (missing.length) {
@@ -593,19 +799,24 @@ async function paginateDirect(buildVars, queryId, opName, handle, uid) {
       (feats) => buildGqlUrl(queryId, opName, buildVars(cursor), feats),
       GQL_FEATURES
     );
+    if (data?.rateLimited) return { rateLimited: true };
     if (!data) break;
+    const before = collected.length;
     collected.push(...tweetsFromGraphQL(data));
-    const posts = formatAndFilterTweets(collected, handle);
+    if (page === 0 && collected.length === before) break;
+    const posts = formatAndFilterTweets(collected, handle, uid);
     if (posts.length >= 3) return posts;
     cursor = findBottomCursor(data);
     if (!cursor) break;
   }
-  return formatAndFilterTweets(collected, handle);
+  return formatAndFilterTweets(collected, handle, uid);
 }
 
 async function fetchTweetsDirect(handle, userId) {
   const uid = (userId && /^\d+$/.test(String(userId)) ? String(userId) : '') || findImportedUserId(handle);
   const queryIds = { ...FALLBACK_QUERY_IDS, ...(importedSession?.queryIds || {}) };
+  let best = [];
+  let isRateLimited = false;
 
   if (queryIds.UserTweets && uid) {
     const posts = await paginateDirect(
@@ -626,10 +837,12 @@ async function fetchTweetsDirect(handle, userId) {
       handle,
       uid
     );
-    if (posts.length) return posts;
+    if (posts?.rateLimited) isRateLimited = true;
+    else if (Array.isArray(posts) && posts.length >= 3) return posts;
+    else if (Array.isArray(posts) && posts.length > best.length) best = posts;
   }
 
-  if (queryIds.SearchTimeline && handle) {
+  if (queryIds.SearchTimeline && handle && !isRateLimited) {
     const posts = await paginateDirect(
       (cursor) => {
         const v = {
@@ -646,7 +859,13 @@ async function fetchTweetsDirect(handle, userId) {
       handle,
       uid
     );
-    if (posts.length) return posts;
+    if (posts?.rateLimited) isRateLimited = true;
+    else if (Array.isArray(posts) && posts.length >= 3) return posts;
+    else if (Array.isArray(posts) && posts.length > best.length) best = posts;
+  }
+
+  if (isRateLimited) {
+    return { rateLimited: true, tweets: [] };
   }
 
   const qs = uid
@@ -654,11 +873,15 @@ async function fetchTweetsDirect(handle, userId) {
     : `screen_name=${encodeURIComponent(handle)}`;
   const restUrl = `https://x.com/i/api/1.1/statuses/user_timeline.json?${qs}&count=50&include_rts=false&exclude_replies=true&tweet_mode=extended`;
   const rest = await xAuthedFetch(restUrl);
+  if (rest?.rateLimited) {
+    return { rateLimited: true, tweets: [] };
+  }
   if (rest?.ok && Array.isArray(rest.data)) {
-    return formatAndFilterTweets(rest.data, handle);
+    const formatted = formatAndFilterTweets(rest.data, handle, uid);
+    if (formatted.length > best.length) best = formatted;
   }
 
-  return null;
+  return best;
 }
 
 function queueBrowserTweetFetch(handle, userId, force) {
@@ -682,24 +905,27 @@ async function waitForBrowserTweets(requestId, timeoutMs = 12000) {
 
 async function fetchTweetsForHandle(handle, forceRefresh = false, userId = '') {
   if (forceRefresh) delete tweetCacheServer[handle];
-  if (!forceRefresh && tweetCacheServer[handle] !== undefined) {
-    return tweetCacheServer[handle];
+  if (!forceRefresh && Array.isArray(tweetCacheServer[handle]) && tweetCacheServer[handle].length > 0) {
+    return { tweets: tweetCacheServer[handle], rateLimited: false };
   }
 
   const direct = await fetchTweetsDirect(handle, userId);
-  if (direct) {
+  if (direct?.rateLimited) {
+    return { tweets: [], rateLimited: true };
+  }
+  if (Array.isArray(direct) && direct.length > 0) {
     tweetCacheServer[handle] = direct;
-    return direct;
+    return { tweets: direct, rateLimited: false };
   }
 
   const requestId = queueBrowserTweetFetch(handle, userId, forceRefresh);
   const bridged = await waitForBrowserTweets(requestId, forceRefresh ? 15000 : 8000);
-  if (bridged) {
+  if (Array.isArray(bridged) && bridged.length > 0) {
     tweetCacheServer[handle] = bridged;
-    return bridged;
+    return { tweets: bridged, rateLimited: false };
   }
 
-  return null;
+  return { tweets: Array.isArray(direct) ? direct : (bridged || []), rateLimited: false };
 }
 
 app.get('/api/x/user_tweets', async (req, res) => {
@@ -711,8 +937,8 @@ app.get('/api/x/user_tweets', async (req, res) => {
     return res.status(400).json({ error: 'Missing handle parameter' });
   }
 
-  const tweets = await fetchTweetsForHandle(handle, force, userId);
-  return res.json({ handle, tweets: tweets || [] });
+  const result = await fetchTweetsForHandle(handle, force, userId);
+  return res.json({ handle, tweets: result?.tweets || [], rateLimited: !!result?.rateLimited });
 });
 
 app.post('/api/x/batch_tweets', async (req, res) => {
@@ -728,14 +954,14 @@ app.post('/api/x/batch_tweets', async (req, res) => {
 
   for (const handle of batch) {
     if (force) delete tweetCacheServer[handle];
-    if (!force && tweetCacheServer[handle] !== undefined) {
+    if (!force && Array.isArray(tweetCacheServer[handle]) && tweetCacheServer[handle].length > 0) {
       results[handle] = tweetCacheServer[handle];
       continue;
     }
     if (fetchedCount > 0) await new Promise((r) => setTimeout(r, 80));
     const direct = await fetchTweetsDirect(handle, ids[handle] || '');
     fetchedCount++;
-    if (direct) {
+    if (Array.isArray(direct) && direct.length > 0) {
       tweetCacheServer[handle] = direct;
       results[handle] = direct;
     } else {
@@ -871,31 +1097,393 @@ app.post('/api/x/following', async (req, res) => {
 
 // ─── LIVE BRIDGE: Queue & execute real-time unfollow actions ────────────────
 app.post('/api/x/queue_unfollow', (req, res) => {
-  const { userId, handle } = req.body;
+  const { userId, handle, force = false } = req.body;
   if (!userId && !handle) return res.status(400).json({ error: 'Missing userId or handle' });
 
-  const exists = pendingUnfollows.find((item) =>
-    (userId && item.userId && String(item.userId) === String(userId)) ||
-    (handle && item.handle && String(item.handle).toLowerCase() === String(handle).toLowerCase())
+  const normHandle = String(handle || '').replace(/^@/, '').toLowerCase();
+  const normId = userId ? String(userId) : '';
+
+  const isCompleted = queueState.completed.some((item) =>
+    (normId && item.userId && String(item.userId) === normId) ||
+    (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
   );
-  if (!exists) {
-    pendingUnfollows.push({ userId: userId ? String(userId) : '', handle, timestamp: Date.now() });
-    console.log(`📌 Queued Live Unfollow for @${handle} (${userId || 'no-id'})`);
+
+  if (isCompleted && !force) {
+    return res.json({ success: true, alreadyCompleted: true, queueLength: queueState.pending.length });
   }
-  return res.json({ success: true, queueLength: pendingUnfollows.length });
+
+  const existsInPending = queueState.pending.some((item) =>
+    (normId && item.userId && String(item.userId) === normId) ||
+    (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+  );
+
+  if (!existsInPending) {
+    queueState.pending.push({ userId: normId, handle: handle || normHandle, timestamp: Date.now(), retries: 0 });
+    // Remove from failed if it was previously failed
+    queueState.failed = queueState.failed.filter((item) =>
+      !( (normId && item.userId && String(item.userId) === normId) ||
+         (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle) )
+    );
+    saveQueue();
+    console.log(`📌 Queued Live Unfollow for @${handle} (${userId || 'no-id'}) [Total Pending: ${queueState.pending.length}]`);
+  }
+  return res.json({ success: true, queueLength: queueState.pending.length });
 });
 
 app.get('/api/x/pending_unfollows', (req, res) => {
-  const list = [...pendingUnfollows];
-  pendingUnfollows = []; // Clear queue after handing over to browser daemon
-  return res.json({ tasks: list });
+  const now = Date.now();
+  if (queueState.isPaused) {
+    return res.json({
+      tasks: [],
+      isPaused: true,
+      rateLimited: false,
+      resetInMs: 0,
+      pendingCount: queueState.pending.length
+    });
+  }
+  if (queueState.rateLimitUntil && queueState.rateLimitUntil > now) {
+    const resetInMs = queueState.rateLimitUntil - now;
+    return res.json({
+      tasks: [],
+      isPaused: false,
+      rateLimited: true,
+      resetInMs,
+      pendingCount: queueState.pending.length
+    });
+  } else if (queueState.rateLimitUntil) {
+    queueState.rateLimitUntil = 0;
+  }
+
+  // Return up to 5 tasks from pending queue
+  const tasks = queueState.pending.slice(0, 5);
+  return res.json({
+    tasks,
+    rateLimited: false,
+    isPaused: false,
+    pendingCount: queueState.pending.length,
+    failedCount: queueState.failed.length,
+    completedCount: queueState.completed.length
+  });
 });
 
 app.post('/api/x/unfollow_result', (req, res) => {
-  const { userId, handle, success, error } = req.body;
-  unfollowResults.push({ userId, handle, success, error, timestamp: Date.now() });
-  console.log(`${success ? '✅' : '❌'} Live Unfollow Result @${handle}: ${success ? 'OK' : error}`);
-  return res.json({ ok: true });
+  const { userId, handle, success, error, isRateLimit, clientVersion } = req.body;
+  if (!clientVersion || clientVersion !== 'v2.5') {
+    return res.json({ ok: false, error: 'Outdated script version' });
+  }
+
+  const normHandle = String(handle || '').replace(/^@/, '').toLowerCase();
+  const normId = userId ? String(userId) : '';
+
+  const is429 = isRateLimit || (error && (String(error).includes('429') || /rate limit/i.test(String(error))));
+
+  if (success) {
+    // Remove from pending & failed, add to completed
+    queueState.pending = queueState.pending.filter((item) =>
+      !( (normId && item.userId && String(item.userId) === normId) ||
+         (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle) )
+    );
+    queueState.failed = queueState.failed.filter((item) =>
+      !( (normId && item.userId && String(item.userId) === normId) ||
+         (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle) )
+    );
+
+    const alreadyDone = queueState.completed.some((item) =>
+      (normId && item.userId && String(item.userId) === normId) ||
+      (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+    );
+    if (!alreadyDone) {
+      queueState.completed.push({ userId: normId, handle, timestamp: Date.now() });
+    }
+    saveQueue();
+    console.log(`✅ Live Unfollow Result @${handle}: OK`);
+  } else if (is429) {
+    // Set rate limit cooldown for 90 seconds
+    queueState.rateLimitUntil = Date.now() + 90000;
+
+    // Update retries count
+    const pendingItem = queueState.pending.find((item) =>
+      (normId && item.userId && String(item.userId) === normId) ||
+      (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+    );
+
+    if (pendingItem) {
+      pendingItem.retries = (pendingItem.retries || 0) + 1;
+      if (pendingItem.retries >= 3) {
+        console.warn(`⚠️ Account @${handle} reached max rate limit retries (${pendingItem.retries}). Moving out of pending to unblock queue.`);
+        queueState.pending = queueState.pending.filter((item) =>
+          !( (normId && item.userId && String(item.userId) === normId) ||
+             (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle) )
+        );
+      }
+    }
+
+    const alreadyFailed = queueState.failed.some((item) =>
+      (normId && item.userId && String(item.userId) === normId) ||
+      (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+    );
+    if (!alreadyFailed) {
+      queueState.failed.push({ userId: normId, handle, error: 'HTTP 429 Rate Limit', isRateLimit: true, timestamp: Date.now() });
+    }
+    saveQueue();
+    console.log(`⚠️ Live Unfollow Rate Limit @${handle}: Pausing queue for 90s (HTTP 429)`);
+  } else {
+    // Other error: Remove from pending, record in failed
+    queueState.pending = queueState.pending.filter((item) =>
+      !( (normId && item.userId && String(item.userId) === normId) ||
+         (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle) )
+    );
+    const alreadyFailed = queueState.failed.some((item) =>
+      (normId && item.userId && String(item.userId) === normId) ||
+      (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+    );
+    if (!alreadyFailed) {
+      queueState.failed.push({ userId: normId, handle, error: String(error || 'Failed'), isRateLimit: false, timestamp: Date.now() });
+    }
+    saveQueue();
+    console.error(`❌ Live Unfollow Error @${handle} (${userId || 'no-id'}): ${error}`);
+  }
+
+  return res.json({
+    ok: true,
+    pendingCount: queueState.pending.length,
+    failedCount: queueState.failed.length,
+    completedCount: queueState.completed.length,
+    rateLimitUntil: queueState.rateLimitUntil
+  });
+});
+
+app.get('/api/x/queue_status', (req, res) => {
+  const now = Date.now();
+  const isRateLimited = Boolean(queueState.rateLimitUntil && queueState.rateLimitUntil > now);
+  const resetInMs = isRateLimited ? queueState.rateLimitUntil - now : 0;
+  if (!isRateLimited && queueState.rateLimitUntil > 0) {
+    queueState.rateLimitUntil = 0;
+  }
+
+  return res.json({
+    pendingCount: queueState.pending.length,
+    failedCount: queueState.failed.length,
+    completedCount: queueState.completed.length,
+    isRateLimited,
+    isPaused: Boolean(queueState.isPaused),
+    resetInMs,
+    pending: queueState.pending,
+    failed: queueState.failed
+  });
+});
+
+app.post('/api/x/pause_queue', (req, res) => {
+  queueState.isPaused = true;
+  saveQueue();
+  console.log('⏸️ Live Queue paused by user.');
+  return res.json({ success: true, isPaused: true, pendingCount: queueState.pending.length });
+});
+
+app.post('/api/x/clear_queue', (req, res) => {
+  const clearedCount = queueState.pending.length;
+  queueState.pending = [];
+  saveQueue();
+  console.log(`🧹 Live Queue cleared (${clearedCount} tasks cancelled).`);
+  return res.json({ success: true, clearedCount, pendingCount: 0 });
+});
+
+app.post('/api/x/remove_from_queue', (req, res) => {
+  const { handle, userId } = req.body || {};
+  const normHandle = String(handle || '').replace(/^@/, '').toLowerCase();
+  const normId = userId ? String(userId) : '';
+  const initialLen = queueState.pending.length;
+  queueState.pending = queueState.pending.filter((item) =>
+    !( (normId && item.userId && String(item.userId) === normId) ||
+       (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle) )
+  );
+  saveQueue();
+  const removed = initialLen - queueState.pending.length;
+  console.log(`🗑️ Removed @${handle || userId} from queue. (Removed: ${removed}, Remaining: ${queueState.pending.length})`);
+  return res.json({ success: true, removed, pendingCount: queueState.pending.length });
+});
+
+app.post('/api/x/resume_queue', (req, res) => {
+  queueState.rateLimitUntil = 0;
+  queueState.isPaused = false;
+  let count = 0;
+  for (const item of queueState.failed) {
+    const exists = queueState.pending.some((p) =>
+      (item.userId && p.userId && String(p.userId) === String(item.userId)) ||
+      (item.handle && p.handle && String(p.handle).toLowerCase() === String(item.handle).toLowerCase())
+    );
+    if (!exists) {
+      queueState.pending.push({ userId: item.userId, handle: item.handle, timestamp: Date.now(), retries: 0 });
+      count++;
+    }
+  }
+  queueState.failed = [];
+  saveQueue();
+  console.log(`▶️ Live Queue manually resumed / triggered (${count} failed items requeued). Pending: ${queueState.pending.length}`);
+  return res.json({ success: true, requeuedCount: count, pendingCount: queueState.pending.length, completedCount: queueState.completed.length, isPaused: false });
+});
+
+app.post('/api/x/reset_queue', (req, res) => {
+  queueState.rateLimitUntil = 0;
+  queueState.isPaused = false;
+  // Requeue all completed and failed tasks back to pending
+  const allItems = [...queueState.completed, ...queueState.failed];
+  let requeuedCount = 0;
+  for (const item of allItems) {
+    const exists = queueState.pending.some((p) =>
+      (item.userId && p.userId && String(p.userId) === String(item.userId)) ||
+      (item.handle && p.handle && String(p.handle).toLowerCase() === String(item.handle).toLowerCase())
+    );
+    if (!exists) {
+      queueState.pending.push({ userId: item.userId, handle: item.handle, timestamp: Date.now(), retries: 0 });
+      requeuedCount++;
+    }
+  }
+  queueState.completed = [];
+  queueState.failed = [];
+  saveQueue();
+  console.log(`🔄 Queue full reset! Requeued ${requeuedCount} accounts. Pending: ${queueState.pending.length}`);
+  return res.json({ success: true, requeuedCount, pendingCount: queueState.pending.length, completedCount: 0 });
+});
+
+app.post('/api/x/requeue_failed', (req, res) => {
+  let count = 0;
+  for (const item of queueState.failed) {
+    const exists = queueState.pending.some((p) =>
+      (item.userId && p.userId && String(p.userId) === String(item.userId)) ||
+      (item.handle && p.handle && String(p.handle).toLowerCase() === String(item.handle).toLowerCase())
+    );
+    if (!exists) {
+      queueState.pending.push({ userId: item.userId, handle: item.handle, timestamp: Date.now(), retries: 0 });
+      count++;
+    }
+  }
+  queueState.failed = [];
+  queueState.rateLimitUntil = 0;
+  queueState.isPaused = false;
+  saveQueue();
+  console.log(`🔄 Re-queued ${count} failed unfollow tasks.`);
+  return res.json({ success: true, requeuedCount: count, pendingCount: queueState.pending.length });
+});
+
+function reverifyCompletedQueue() {
+  if (!importedSession || !Array.isArray(importedSession.following)) {
+    return { verifiedCompletedCount: queueState.completed.length, requeuedCount: 0, purgedAlreadyUnfollowed: 0 };
+  }
+
+  const liveHandles = new Set(importedSession.following.map((u) => (u.screen_name || '').toLowerCase()));
+  const liveIds = new Set(importedSession.following.map((u) => String(u.id_str || u.id || '')));
+
+  // 1. Clean pending: Keep ONLY accounts that are STILL in live following list
+  const initialPendingCount = queueState.pending.length;
+  const genuinelyPending = [];
+  const alreadyUnfollowedInPending = [];
+
+  for (const item of queueState.pending) {
+    const normH = String(item.handle || '').toLowerCase();
+    const normId = String(item.userId || '');
+    const isStillFollowing = (normH && liveHandles.has(normH)) || (normId && liveIds.has(normId));
+    if (isStillFollowing) {
+      genuinelyPending.push(item);
+    } else {
+      alreadyUnfollowedInPending.push(item);
+    }
+  }
+
+  queueState.pending = genuinelyPending;
+  const purgedAlreadyUnfollowed = initialPendingCount - genuinelyPending.length;
+
+  for (const item of alreadyUnfollowedInPending) {
+    const normH = String(item.handle || '').toLowerCase();
+    const normId = String(item.userId || '');
+    const alreadyCompleted = queueState.completed.some((c) =>
+      (normH && String(c.handle || '').toLowerCase() === normH) ||
+      (normId && String(c.userId || '') === normId)
+    );
+    if (!alreadyCompleted) {
+      queueState.completed.push({ userId: normId, handle: item.handle, timestamp: Date.now() });
+    }
+  }
+
+  // 2. Re-verify completed list
+  const genuinelyCompleted = [];
+  let requeuedCount = 0;
+
+  for (const item of queueState.completed) {
+    const normH = String(item.handle || '').toLowerCase();
+    const normId = String(item.userId || '');
+
+    const isStillFollowing = (normH && liveHandles.has(normH)) || (normId && liveIds.has(normId));
+    if (isStillFollowing) {
+      const existsInPending = queueState.pending.some((p) =>
+        (normH && String(p.handle || '').toLowerCase() === normH) ||
+        (normId && String(p.userId || '') === normId)
+      );
+      if (!existsInPending) {
+        queueState.pending.unshift({ userId: item.userId, handle: item.handle, timestamp: Date.now(), retries: 0 });
+        requeuedCount++;
+      }
+    } else {
+      genuinelyCompleted.push(item);
+    }
+  }
+
+  queueState.completed = genuinelyCompleted;
+  saveQueue();
+
+  console.log(`🔄 Live Sync Audit: ${genuinelyPending.length} accounts STILL FOLLOWED on X (pending queue). Purged ${purgedAlreadyUnfollowed} accounts already unfollowed on X.`);
+  return { verifiedCompletedCount: genuinelyCompleted.length, requeuedCount, purgedAlreadyUnfollowed, pendingCount: genuinelyPending.length };
+}
+
+app.post('/api/x/reverify_completed', (req, res) => {
+  const result = reverifyCompletedQueue();
+  return res.json({
+    success: true,
+    ...result,
+    pendingCount: queueState.pending.length,
+    completedCount: queueState.completed.length
+  });
+});
+
+app.post('/api/x/sync_live_diff', (req, res) => {
+  const { unfollowedItems = [] } = req.body; // array of { handle, userId }
+  let addedCount = 0;
+
+  for (const target of unfollowedItems) {
+    const normHandle = String(target.handle || '').replace(/^@/, '').toLowerCase();
+    const normId = target.userId || target.id ? String(target.userId || target.id) : '';
+
+    if (!normHandle && !normId) continue;
+
+    const isCompleted = queueState.completed.some((item) =>
+      (normId && item.userId && String(item.userId) === normId) ||
+      (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+    );
+
+    if (!isCompleted) {
+      const isPending = queueState.pending.some((item) =>
+        (normId && item.userId && String(item.userId) === normId) ||
+        (normHandle && item.handle && String(item.handle).toLowerCase() === normHandle)
+      );
+      if (!isPending) {
+        queueState.pending.push({ userId: normId, handle: target.handle || normHandle, timestamp: Date.now(), retries: 0 });
+        addedCount++;
+      }
+    }
+  }
+
+  if (addedCount > 0) {
+    saveQueue();
+    console.log(`⚡ Live Sync: Added ${addedCount} unconfirmed unfollows to queue. Total Pending: ${queueState.pending.length}`);
+  }
+
+  return res.json({
+    success: true,
+    addedCount,
+    pendingCount: queueState.pending.length,
+    failedCount: queueState.failed.length,
+    completedCount: queueState.completed.length
+  });
 });
 
 // ─── Start ──────────────────────────────────────────────────────────────────────

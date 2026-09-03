@@ -69,7 +69,11 @@ async function fetchUserTweetsFromServer(handle, userId, force) {
   if (userId) params.set('userId', userId);
   const r = await fetch(`/api/x/user_tweets?${params.toString()}`);
   const data = await r.json();
-  return data.tweets || [];
+  return {
+    tweets: data.tweets || [],
+    rateLimited: !!data.rateLimited,
+    success: r.ok && !data.rateLimited
+  };
 }
 
 async function fetchTweetsBatchFromServer(items, force) {
@@ -87,11 +91,26 @@ async function fetchTweetsBatchFromServer(items, force) {
 }
 
 export async function fetchUserTweets(handle, { userId, force } = {}) {
+  let tweets = [];
   try {
-    return await fetchTweetsFromExtension(handle, userId, force);
+    tweets = await fetchTweetsFromExtension(handle, userId, force);
+    if (Array.isArray(tweets) && tweets.length >= 3) {
+      return { tweets, rateLimited: false, success: true };
+    }
   } catch {
-    return fetchUserTweetsFromServer(handle, userId, force);
+    tweets = [];
   }
+  try {
+    const serverRes = await fetchUserTweetsFromServer(handle, userId, force);
+    if (serverRes.rateLimited) {
+      return { tweets: tweets || [], rateLimited: true, success: false };
+    }
+    if (Array.isArray(serverRes.tweets) && serverRes.tweets.length > (tweets?.length || 0)) {
+      return { tweets: serverRes.tweets, rateLimited: false, success: true };
+    }
+    return { tweets: serverRes.tweets || tweets || [], rateLimited: false, success: serverRes.success };
+  } catch {}
+  return { tweets: tweets || [], rateLimited: false, success: tweets.length > 0 };
 }
 
 export async function fetchTweetsBatch(items, { force } = {}) {

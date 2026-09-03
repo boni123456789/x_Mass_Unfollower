@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { X, ShieldCheck, Key, RefreshCw, CheckCircle, LogOut, ArrowRight, ExternalLink, Copy, Check, Terminal, Zap } from 'lucide-react';
 import { verifyXCredentials } from '../services/xApi';
+import { useLanguage } from '../i18n/LanguageContext.jsx';
 
 export default function LoginModal({ isOpen, onClose, onLogin, onLogout, currentUser }) {
+  const { t } = useLanguage();
   const [authToken, setAuthToken] = useState('');
   const [ct0Token, setCt0Token] = useState('');
   const [customHandle, setCustomHandle] = useState('');
@@ -24,7 +26,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
     fetch('/import-script.js')
       .then(r => r.text())
       .then(text => setImportScriptContent(text))
-      .catch(() => setImportScriptContent('alert("Fehler: import-script.js konnte nicht geladen werden");'));
+      .catch(() => setImportScriptContent('alert("Error: import-script.js could not be loaded");'));
   }, []);
 
   // Listen for Extension responses
@@ -36,13 +38,13 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
           handleCheckImport();
         } else {
           setIsAuthenticating(false);
-          setErrorMsg(response.error || 'Erweiterungs-Sync fehlgeschlagen. Bitte stelle sicher, dass du auf x.com eingeloggt bist.');
+          setErrorMsg(response.error || t('loginModal.errorExtensionSync'));
         }
       }
     };
     window.addEventListener('message', handleExtensionMsg);
     return () => window.removeEventListener('message', handleExtensionMsg);
-  }, []);
+  }, [t]);
 
   if (!isOpen) return null;
 
@@ -62,7 +64,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
     setTimeout(() => {
       setIsAuthenticating(prev => {
         if (prev) {
-          setErrorMsg('Konnte X-Daten nicht automatisch laden. Öffne x.com in deinem Browser und klicke unten rechts "⚡ Sync mit CleanSweep X".');
+          setErrorMsg(t('loginModal.errorTimeout'));
           return false;
         }
         return false;
@@ -78,7 +80,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
       const res = await fetch('/api/x/imported');
       if (!res.ok) {
         const data = await res.json();
-        setErrorMsg(data.error || 'Noch keine Daten importiert. Führe zuerst den Sync auf x.com aus.');
+        setErrorMsg(data.error || t('loginModal.errorNoDataYet'));
         setIsAuthenticating(false);
         return;
       }
@@ -94,7 +96,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         onClose();
       }
     } catch (e) {
-      setErrorMsg('Server nicht erreichbar. Läuft node server.js auf Port 3001?');
+      setErrorMsg(t('loginModal.errorServerDown'));
       setIsAuthenticating(false);
     }
   };
@@ -109,25 +111,22 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         try {
           content = await navigator.clipboard.readText();
         } catch (clipErr) {
-          throw new Error('Zugriff auf Zwischenablage verweigert. Nutze bitte "📁 JSON-Datei hochladen".');
+          throw new Error(t('loginModal.errorClipboardDenied'));
         }
       }
       if (!content || !content.trim()) {
-        throw new Error('Zwischenablage ist leer. Führe zuerst den Sync aus!');
+        throw new Error(t('loginModal.errorClipboardEmpty'));
       }
 
       content = content.trim();
 
       if (content.startsWith('//') || content.startsWith('(async') || content.startsWith('const ') || !content.startsWith('{')) {
-        throw new Error(
-          '⚠️ In deiner Zwischenablage befindet sich Skript-Code, nicht die generierten Profil-Daten!\n\n' +
-          'Klicke stattdessen oben auf "⚡ 1-Klick Extension Auto-Sync" oder führe den Sync auf x.com aus.'
-        );
+        throw new Error(t('loginModal.errorScriptInClipboard'));
       }
 
       const parsed = JSON.parse(content);
       if (!parsed.profile || !parsed.following) {
-        throw new Error('Ungültiges JSON-Format. Die Datei muss "profile" und "following" enthalten.');
+        throw new Error(t('loginModal.errorInvalidJson'));
       }
 
       const postRes = await fetch('/api/x/import', {
@@ -137,12 +136,12 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
       });
       const postData = await postRes.json();
       if (!postData.success) {
-        throw new Error(postData.error || 'Server lehnte den Import ab.');
+        throw new Error(postData.error || 'Server rejected the import.');
       }
 
       const getRes = await fetch('/api/x/imported');
       if (!getRes.ok) {
-        throw new Error('Fehler beim Abrufen der importierten Daten.');
+        throw new Error(t('loginModal.errorFetchImported'));
       }
       const data = await getRes.json();
 
@@ -156,7 +155,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         setIsAuthenticating(false);
         onClose();
       } else {
-        throw new Error('Formatierte Benutzerdaten fehlen im Server-Response.');
+        throw new Error(t('loginModal.errorMissingData'));
       }
     } catch (e) {
       setErrorMsg(e.message);
@@ -182,7 +181,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
     const cleanCt = ct0Token.trim().replace(/^["']|["']$/g, '').trim();
 
     if (!cleanAuth || !cleanCt) {
-      setErrorMsg('Bitte beide Session Tokens (auth_token & ct0) eingeben.');
+      setErrorMsg(t('loginModal.errorTokensRequired'));
       return;
     }
 
@@ -196,7 +195,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
       onClose();
     } catch (err) {
       setIsAuthenticating(false);
-      setErrorMsg(err.message + '\n\n💡 Tipp: Nutze stattdessen "1-Klick Extension Import".');
+      setErrorMsg(err.message + '\n\n💡 Tipp: ' + t('loginModal.tabExtension'));
     }
   };
 
@@ -229,7 +228,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
               <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
             </svg>
             <h2 style={{ fontSize: '1.2rem', fontWeight: 850, letterSpacing: '-0.02em', color: 'var(--text-primary)' }}>
-              Mit X (Twitter) verbinden
+              {t('loginModal.title')}
             </h2>
           </div>
           <button 
@@ -254,9 +253,9 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         {currentUser && (
           <div style={{ padding: '12px 16px', background: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: 'var(--radius-md)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <div style={{ fontSize: '0.85rem' }}>
-              <span style={{ color: 'var(--text-secondary)' }}>Eingeloggt als </span>
+              <span style={{ color: 'var(--text-secondary)' }}>{t('loginModal.loggedInAs')}</span>
               <strong style={{ color: 'var(--text-primary)' }}>@{currentUser.handle}</strong>
-              {currentUser.isRealSession && <span style={{ marginLeft: '6px', color: '#10B981', fontWeight: 700 }}>● Echter X-Live Account</span>}
+              {currentUser.isRealSession && <span style={{ marginLeft: '6px', color: '#10B981', fontWeight: 700 }}>{t('loginModal.realLiveAccount')}</span>}
             </div>
             <button 
               type="button" 
@@ -264,7 +263,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
               style={{ background: 'var(--unfollow-red)', border: 'none', color: '#fff', padding: '6px 14px', borderRadius: '8px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}
             >
               <LogOut size={14} />
-              <span>Abmelden</span>
+              <span>{t('loginModal.logoutBtn')}</span>
             </button>
           </div>
         )}
@@ -278,7 +277,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
             style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 14px', fontSize: '0.8rem' }}
           >
             <Zap size={14} color="#10B981" />
-            1-Klick Extension Sync
+            {t('loginModal.tabExtension')}
           </button>
           <button
             type="button"
@@ -286,7 +285,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
             onClick={() => { setAuthMethod('x_session'); setErrorMsg(null); }}
             style={{ padding: '6px 14px', fontSize: '0.8rem' }}
           >
-            Token-Login
+            {t('loginModal.tabToken')}
           </button>
           <button
             type="button"
@@ -294,7 +293,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
             onClick={() => { setAuthMethod('demo'); setErrorMsg(null); }}
             style={{ padding: '6px 14px', fontSize: '0.8rem' }}
           >
-            Demo Mode
+            {t('loginModal.tabDemo')}
           </button>
         </div>
 
@@ -308,7 +307,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         <div style={{ padding: '14px 16px', background: 'var(--bg-card-hover)', border: '1px solid var(--border-strong)', borderRadius: 'var(--radius-md)', display: 'flex', flexDirection: 'column', gap: '10px' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <strong style={{ color: 'var(--text-primary)', fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <Zap size={16} color="#10B981" /> Chrome Extension Status
+              <Zap size={16} color="#10B981" /> {t('loginModal.extStatusTitle')}
             </strong>
             <span style={{ 
               fontSize: '0.68rem', 
@@ -318,19 +317,19 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
               padding: '2px 8px', 
               borderRadius: '999px' 
             }}>
-              {isExtensionInstalled ? '✅ AKTIV & VERBUNDEN' : '10 SEK. INSTALLATION'}
+              {isExtensionInstalled ? t('loginModal.extStatusActive') : t('loginModal.extStatusInstall')}
             </span>
           </div>
           <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.4 }}>
             {isExtensionInstalled 
-              ? 'Die Erweiterung ist in deinem Browser aktiv. Du kannst Daten mit 1 Klick vollautomatisch ohne F12 Konsole laden!' 
-              : 'Aktiviere die Entwickler-Erweiterung in Chrome, um Daten vollautomatisch mit 1 Klick ohne Konsole zu laden.'}
+              ? t('loginModal.extDescActive') 
+              : t('loginModal.extDescInactive')}
           </p>
           {!isExtensionInstalled && (
             <div style={{ fontSize: '0.78rem', color: 'var(--text-primary)', background: 'var(--bg-input)', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-              1. Öffne Chrome: <code style={{ color: 'var(--accent-blue)', fontWeight: 700 }}>chrome://extensions</code><br/>
-              2. Aktiviere <strong>"Entwicklermodus"</strong> → <strong>"Entpackte Erweiterung laden"</strong><br/>
-              3. Wähle Ordner: <strong style={{ color: 'var(--text-primary)', wordBreak: 'break-all', fontFamily: 'var(--font-mono)' }}>c:\Users\marco\Desktop\x_Mass_Unfollower\extension</strong>
+              {t('loginModal.extStep1')} <code style={{ color: 'var(--accent-blue)', fontWeight: 700 }}>chrome://extensions</code><br/>
+              {t('loginModal.extStep2')}<br/>
+              {t('loginModal.extStep3')}<strong style={{ color: 'var(--text-primary)', wordBreak: 'break-all', fontFamily: 'var(--font-mono)' }}>c:\Users\marco\Desktop\x_Mass_Unfollower\extension</strong>
             </div>
           )}
         </div>
@@ -360,11 +359,11 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
               }}
             >
               {isAuthenticating ? <RefreshCw size={18} className="spin" /> : <Zap size={18} />}
-              <span>{isAuthenticating ? 'Synchronisiere mit X.com...' : '⚡ 1-Klick Extension Auto-Sync starten'}</span>
+              <span>{isAuthenticating ? t('loginModal.btnSyncing') : t('loginModal.btnStartAutoSync')}</span>
             </button>
 
             <div style={{ textAlign: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', margin: '4px 0' }}>
-              — ODER MANUELLER FALLBACK (FALLS OHNE EXTENSION) —
+              {t('loginModal.fallbackDivider')}
             </div>
 
             <div style={{ display: 'flex', gap: '10px' }}>
@@ -383,7 +382,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
                 }}
               >
                 {copiedScript ? <Check size={16} /> : <Copy size={16} />}
-                <span>{copiedScript ? 'Skript kopiert!' : 'Skript für F12 kopieren'}</span>
+                <span>{copiedScript ? t('loginModal.btnCopiedF12') : t('loginModal.btnCopyF12')}</span>
               </button>
 
               <button
@@ -402,7 +401,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
                 }}
               >
                 <CheckCircle size={16} />
-                <span>Aus Zwischenablage</span>
+                <span>{t('loginModal.btnFromClipboard')}</span>
               </button>
             </div>
 
@@ -424,7 +423,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
                   cursor: 'pointer'
                 }}
               >
-                📁 JSON-Datei hochladen
+                {t('loginModal.btnUploadJson')}
                 <input type="file" accept=".json" onChange={handleFileUpload} style={{ display: 'none' }} />
               </label>
 
@@ -443,7 +442,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
                   cursor: 'pointer'
                 }}
               >
-                🔄 Direct Check
+                {t('loginModal.btnDirectCheck')}
               </button>
             </div>
           </div>
@@ -453,12 +452,12 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         {authMethod === 'x_session' && (
           <form onSubmit={handleNativeXConnect} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             <div style={{ padding: '10px 14px', background: 'rgba(217, 119, 6, 0.1)', border: '1px solid rgba(217, 119, 6, 0.3)', borderRadius: 'var(--radius-md)', fontSize: '0.8rem', color: 'var(--gold-accent)' }}>
-              ⚠️ Token-Login kann von X TLS-Fingerprinting blockiert werden. Nutze stattdessen den "1-Klick Extension Sync".
+              {t('loginModal.tokenWarning')}
             </div>
 
             <div>
               <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-primary)', display: 'block', marginBottom: '4px' }}>
-                1. auth_token (Session Cookie)
+                {t('loginModal.tokenAuthLabel')}
               </label>
               <input
                 type="password"
@@ -472,7 +471,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
 
             <div>
               <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-primary)', display: 'block', marginBottom: '4px' }}>
-                2. ct0 (CSRF Token)
+                {t('loginModal.tokenCt0Label')}
               </label>
               <input
                 type="password"
@@ -490,7 +489,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
               className="btn-primary"
               style={{ padding: '12px', fontSize: '0.9rem', fontWeight: 800, marginTop: '6px' }}
             >
-              {isAuthenticating ? 'Verbinde mit X.com...' : 'Mit Tokens einloggen →'}
+              {isAuthenticating ? t('loginModal.tokenConnecting') : t('loginModal.tokenSubmit')}
             </button>
           </form>
         )}
@@ -499,7 +498,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
         {authMethod === 'demo' && (
           <form onSubmit={handleDemoConnect} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             <div style={{ padding: '10px 14px', background: 'var(--bg-card-hover)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-md)', fontSize: '0.84rem', color: 'var(--text-secondary)' }}>
-              Startet die interaktive Vorschau mit 12 Beispiel-Profilen zum Testen der Shortcuts.
+              {t('loginModal.demoDesc')}
             </div>
 
             <div>
@@ -521,7 +520,7 @@ export default function LoginModal({ isOpen, onClose, onLogin, onLogout, current
               className="btn-primary"
               style={{ padding: '12px', fontSize: '0.9rem', fontWeight: 800, marginTop: '6px' }}
             >
-              Demo-Modus starten →
+              {t('loginModal.demoSubmit')}
             </button>
           </form>
         )}

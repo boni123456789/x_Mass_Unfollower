@@ -58,6 +58,34 @@ async function getXTab() {
   return tabs.find((t) => t.id && t.url && !t.url.includes('/i/flow/')) || tabs[0] || null;
 }
 
+let isOpeningXTab = false;
+async function getOrOpenXTab() {
+  let tab = await getXTab();
+  if (tab) return tab;
+
+  if (isOpeningXTab) return null;
+  isOpeningXTab = true;
+  try {
+    console.log('🌐 No open x.com tab found. Opening a background x.com tab...');
+    tab = await chrome.tabs.create({ url: 'https://x.com/home', active: false });
+    await new Promise((resolve) => {
+      const listener = (tabId, info) => {
+        if (tabId === tab.id && info.status === 'complete') {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      setTimeout(resolve, 8000);
+    });
+    await new Promise((r) => setTimeout(r, 1500));
+    await ensureXContent(tab);
+    return tab;
+  } finally {
+    isOpeningXTab = false;
+  }
+}
+
 async function ensureXContent(tab) {
   if (!tab?.id) return null;
   try {
@@ -76,8 +104,8 @@ async function ensureXContent(tab) {
   return tab;
 }
 
-async function sendToXTab(msg, timeoutMs = 35000) {
-  const tab = await getXTab();
+async function sendToXTab(msg, timeoutMs = 35000, autoOpen = true) {
+  let tab = autoOpen ? await getOrOpenXTab() : await getXTab();
   if (!tab) return null;
   await ensureXContent(tab);
   let res = await tabMessage(tab.id, msg, timeoutMs);
@@ -159,7 +187,9 @@ async function paginateWithCookies(headers, features, buildVars, queryId, opName
       features
     );
     if (!data) break;
+    const before = collected.length;
     collected.push(...Core.tweetsFromGraphQL(data));
+    if (page === 0 && collected.length === before) break;
     const posts = Core.formatAndFilterTweets(collected, handle, uid);
     if (posts.length >= 3) return posts;
     cursor = Core.findBottomCursor(data);
@@ -182,6 +212,11 @@ async function fetchTweetsWithCookies(handle, userId) {
   if (!uid) uid = await resolveUserIdWithCookies(handle, headers);
   const features = Core.GQL_FEATURES;
   const ids = Core.FALLBACK_QUERY_IDS;
+  let best = [];
+  const take = (posts) => {
+    if (Array.isArray(posts) && posts.length > best.length) best = posts;
+    return best.length >= 3;
+  };
 
   if (ids.UserTweets && uid) {
     const posts = await paginateWithCookies(
@@ -189,7 +224,7 @@ async function fetchTweetsWithCookies(handle, userId) {
       (cursor) => Core.userTweetsVariables(uid, cursor),
       ids.UserTweets, 'UserTweets', handle, uid
     );
-    if (posts.length) return posts;
+    if (take(posts)) return best;
   }
   if (ids.SearchTimeline && handle) {
     const posts = await paginateWithCookies(
@@ -197,25 +232,25 @@ async function fetchTweetsWithCookies(handle, userId) {
       (cursor) => Core.searchVariables(handle, cursor),
       ids.SearchTimeline, 'SearchTimeline', handle, uid
     );
-    if (posts.length) return posts;
+    if (take(posts)) return best;
   }
 
   const qs = uid ? `user_id=${encodeURIComponent(uid)}` : `screen_name=${encodeURIComponent(handle)}`;
   const url = `https://x.com/i/api/1.1/statuses/user_timeline.json?${qs}&count=50&include_rts=false&exclude_replies=true&tweet_mode=extended`;
   const response = await fetch(url, { headers });
-  if (!response.ok) return [];
-  return Core.formatAndFilterTweets(await response.json(), handle, uid);
+  if (response.ok) take(Core.formatAndFilterTweets(await response.json(), handle, uid));
+  return best;
 }
 
 async function fetchPreviewTweets(handle, userId) {
   const inPage = await fetchTweetsViaXTab(handle, userId);
-  if (inPage?.success && Array.isArray(inPage.tweets) && inPage.tweets.length > 0) {
-    return inPage.tweets;
-  }
+  const inTweets = (inPage?.success && Array.isArray(inPage.tweets)) ? inPage.tweets : [];
+  if (inTweets.length >= 3) return inTweets;
   const viaCookies = await fetchTweetsWithCookies(handle, userId);
-  if (viaCookies && viaCookies.length > 0) return viaCookies;
-  if (inPage?.success && Array.isArray(inPage.tweets)) return inPage.tweets;
-  if (viaCookies) return viaCookies;
+  const cookieTweets = Array.isArray(viaCookies) ? viaCookies : [];
+  if (cookieTweets.length > inTweets.length) return cookieTweets;
+  if (inTweets.length) return inTweets;
+  if (cookieTweets.length) return cookieTweets;
   throw new Error('tweet_fetch_failed');
 }
 
@@ -516,3 +551,110 @@ setInterval(async () => {
     }
   } catch (e) {}
 }, 900);
+
+// ── Toolbar Icon Click -> Trigger Sync & Focus CleanSweep X ──
+chrome.action.onClicked.addListener(async () => {
+  console.log('🔘 CleanSweep X extension icon clicked! Syncing...');
+
+  chrome.action.setBadgeText({ text: '...' });
+  chrome.action.setBadgeBackgroundColor({ color: '#F59E0B' });
+
+  // Ensure an X tab exists or open one in background
+  const xTab = await getOrOpenXTab();
+
+  // Perform background sync
+  const syncResult = await performBackgroundSync();
+
+  if (syncResult && syncResult.success) {
+    console.log(`✅ Synced ${syncResult.count} accounts via extension icon click!`);
+    chrome.action.setBadgeText({ text: '✓' });
+    chrome.action.setBadgeBackgroundColor({ color: '#10B981' });
+    setTimeout(() => chrome.action.setBadgeText({ text: '' }), 4000);
+
+    // Focus or open CleanSweep X
+    const appTabs = await chrome.tabs.query({ url: ['http://localhost:5173/*', 'http://127.0.0.1:5173/*'] });
+    if (appTabs.length > 0 && appTabs[0].id) {
+      chrome.tabs.update(appTabs[0].id, { active: true });
+      chrome.tabs.reload(appTabs[0].id);
+    } else {
+      chrome.tabs.create({ url: 'http://localhost:5173/' });
+    }
+  } else {
+    console.error('❌ Extension sync error:', syncResult?.error);
+    chrome.action.setBadgeText({ text: 'ERR' });
+    chrome.action.setBadgeBackgroundColor({ color: '#EF4444' });
+    setTimeout(() => chrome.action.setBadgeText({ text: '' }), 4000);
+
+    // If cookies are missing, open X tab for user to login
+    if (!xTab) {
+      chrome.tabs.create({ url: 'https://x.com/home' });
+    }
+  }
+});
+
+// ── Automatic Background Live Unfollow Queue Poller ──
+let isBgQueueBusy = false;
+
+async function processBackgroundUnfollowQueue() {
+  if (isBgQueueBusy) return;
+  isBgQueueBusy = true;
+
+  try {
+    const res = await fetch('http://localhost:3001/api/x/pending_unfollows');
+    if (!res.ok) {
+      isBgQueueBusy = false;
+      return;
+    }
+
+    const data = await res.json();
+    if (data.isPaused || data.rateLimited || !data.tasks || data.tasks.length === 0) {
+      if (data.pendingCount > 0) {
+        chrome.action.setBadgeText({ text: String(data.pendingCount) });
+        chrome.action.setBadgeBackgroundColor({ color: data.rateLimited ? '#EF4444' : '#1D9BF0' });
+      }
+      isBgQueueBusy = false;
+      return;
+    }
+
+    // Ensure X tab is available (auto-opening in background if none exists)
+    const tab = await getOrOpenXTab();
+    if (!tab) {
+      isBgQueueBusy = false;
+      return;
+    }
+
+    const task = data.tasks[0];
+    console.log(`🚀 [CleanSweep BG Worker] Live Unfollowing @${task.handle}...`);
+
+    let result = await sendToXTab({
+      type: 'UNFOLLOW_USER_INPAGE',
+      handle: task.handle,
+      userId: task.userId
+    }, 20000);
+
+    const isSuccess = !!result?.success;
+    const is429 = !!result?.isRateLimit || result?.status === 429;
+    const errorMsg = result?.error || (isSuccess ? '' : 'Failed');
+
+    await fetch('http://localhost:3001/api/x/unfollow_result', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: task.userId,
+        handle: task.handle,
+        success: isSuccess,
+        error: errorMsg,
+        isRateLimit: is429,
+        clientVersion: 'v2.5'
+      })
+    });
+
+    await new Promise(r => setTimeout(r, 1900 + Math.random() * 800));
+  } catch (e) {
+    // server down or network error
+  } finally {
+    isBgQueueBusy = false;
+  }
+}
+
+setInterval(processBackgroundUnfollowQueue, 2500);

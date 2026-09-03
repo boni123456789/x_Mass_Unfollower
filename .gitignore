@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local Session & Queue Cache
+imported_session.json
+unfollow_queue.json

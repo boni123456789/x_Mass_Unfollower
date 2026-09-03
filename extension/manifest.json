@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CleanSweep X - Live Bridge",
-  "version": "1.4.3",
+  "version": "1.4.5",
   "description": "Live cookie/session bridge: unfollow + tweet preview via the open x.com tab.",
   "permissions": [
     "cookies",
@@ -70,7 +70,17 @@
       "run_at": "document_idle"
     }
   ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "action": {
-    "default_title": "CleanSweep X Bridge"
+    "default_title": "CleanSweep X - Click to Sync with X.com",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   }
 }
